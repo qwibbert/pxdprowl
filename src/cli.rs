@@ -3,7 +3,9 @@
 //! Defines the clap argument structure and the [`run`] dispatcher that
 //! executes each subcommand against the PRIDE archive.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser, Subcommand};
@@ -133,6 +135,11 @@ pub async fn run(args: Args) -> Result<()> {
         .build()
         .context("failed to build HTTP client")?;
 
+    // One set of concurrency limits for the whole run, shared by every
+    // download request so the configured caps stay global when multiple
+    // datasets run concurrently.
+    let limits = Arc::new(common::ConcurrencyLimits::new(config));
+
     info!(
         "Config: output={}, download-concurrency={}, validate-concurrency={}, max-retries={} ({} CPUs)",
         config.output.display(),
@@ -169,7 +176,7 @@ pub async fn run(args: Args) -> Result<()> {
                 } => DownloadRequest::Url(url.clone()),
                 Commands::Files { .. } => unreachable!("Files is dispatched above"),
             };
-            cmd_download(&client, config, &action, &multi).await
+            cmd_download(&client, config, &limits, &action, &multi).await
         }
         None => {
             if resolved.downloads.is_empty() {
@@ -181,26 +188,50 @@ pub async fn run(args: Args) -> Result<()> {
                     .context("failed to print help")?;
                 return Ok(());
             }
-            // Batch from the config file: run every request, collect failures,
-            // and summarize at the end instead of stopping at the first one.
+            // Batch from the config file: run every request concurrently so a
+            // small dataset doesn't delay the others, collect failures, and
+            // summarize at the end instead of stopping at the first one.
+            let downloads = dedupe_requests(&resolved.downloads);
             // With multiple requests, show an overall count bar on top of the
             // per-request bars.
-            let overall = (resolved.downloads.len() > 1).then(|| {
-                let bar = multi.add(ProgressBar::new(resolved.downloads.len() as u64));
+            let overall = (downloads.len() > 1).then(|| {
+                let bar = multi.add(ProgressBar::new(downloads.len() as u64));
                 bar.set_style(common::count_style());
                 bar.set_prefix("Downloads");
                 bar
             });
-            let mut failed = Vec::new();
-            for request in &resolved.downloads {
+            let mut set = tokio::task::JoinSet::new();
+            for request in &downloads {
+                let client = client.clone();
+                let config = config.clone();
+                let limits = limits.clone();
+                let multi = multi.clone();
+                let overall = overall.clone();
+                let request = (*request).clone();
                 let label = request.label();
-                info!("starting {label}");
-                if let Err(e) = cmd_download(&client, config, request, &multi).await {
-                    warn!("{label} failed: {e:#}");
-                    failed.push(label);
-                }
-                if let Some(bar) = &overall {
-                    bar.inc(1);
+                set.spawn(async move {
+                    info!("starting {label}");
+                    let result = cmd_download(&client, &config, &limits, &request, &multi).await;
+                    if let Some(bar) = &overall {
+                        bar.inc(1);
+                    }
+                    (label, result)
+                });
+            }
+            // Collect results as tasks complete (completion order, not spawn
+            // order) and summarize failures at the end.
+            let mut failed = Vec::new();
+            while let Some(task_result) = set.join_next().await {
+                match task_result {
+                    Ok((_label, Ok(()))) => {}
+                    Ok((label, Err(e))) => {
+                        warn!("{label} failed: {e:#}");
+                        failed.push(label);
+                    }
+                    Err(e) => {
+                        warn!("download task panicked: {e}");
+                        failed.push("unknown".to_string());
+                    }
                 }
             }
             if let Some(bar) = &overall {
@@ -272,16 +303,19 @@ fn hint_subcommand_overrides_config(resolved: &ResolvedConfig) {
 async fn cmd_download(
     client: &reqwest::Client,
     config: &Config,
+    limits: &Arc<common::ConcurrencyLimits>,
     request: &DownloadRequest,
     multi: &MultiProgress,
 ) -> Result<()> {
     match request {
-        DownloadRequest::Dataset(accession) => cmd_dataset(client, config, accession, multi).await,
+        DownloadRequest::Dataset(accession) => {
+            cmd_dataset(client, config, limits, accession, multi).await
+        }
         DownloadRequest::File {
             accession,
             file_name,
-        } => cmd_file_by_name(client, config, accession, file_name, multi).await,
-        DownloadRequest::Url(url) => cmd_file_by_url(client, config, url, multi).await,
+        } => cmd_file_by_name(client, config, limits, accession, file_name, multi).await,
+        DownloadRequest::Url(url) => cmd_file_by_url(client, config, limits, url, multi).await,
     }
 }
 
@@ -290,10 +324,11 @@ async fn cmd_download(
 async fn cmd_dataset(
     client: &reqwest::Client,
     config: &Config,
+    limits: &Arc<common::ConcurrencyLimits>,
     accession: &str,
     multi: &MultiProgress,
 ) -> Result<()> {
-    let count = Pride::download_dataset(client, config, accession, &config.output, multi)
+    let count = Pride::download_dataset(client, config, limits, accession, &config.output, multi)
         .await
         .with_context(|| format!("failed to download dataset {accession}"))?;
     println!(
@@ -332,6 +367,7 @@ async fn cmd_files(client: &reqwest::Client, config: &Config, accession: &str) -
 async fn cmd_file_by_name(
     client: &reqwest::Client,
     config: &Config,
+    limits: &Arc<common::ConcurrencyLimits>,
     accession: &str,
     file_name: &str,
     multi: &MultiProgress,
@@ -356,6 +392,13 @@ async fn cmd_file_by_name(
         .with_context(|| format!("failed to create {}", dest_dir.display()))?;
     let dest = dest_dir.join(file_name);
 
+    // Count against the global download cap, like dataset files do.
+    let _permit = limits
+        .downloads
+        .clone()
+        .acquire_owned()
+        .await
+        .context("download semaphore closed unexpectedly")?;
     Pride::download_file(client, config, &url, &dest, multi).await?;
     println!("Downloaded {file_name} -> {}", dest.display());
     Ok(())
@@ -365,6 +408,7 @@ async fn cmd_file_by_name(
 async fn cmd_file_by_url(
     client: &reqwest::Client,
     config: &Config,
+    limits: &Arc<common::ConcurrencyLimits>,
     url: &str,
     multi: &MultiProgress,
 ) -> Result<()> {
@@ -380,6 +424,13 @@ async fn cmd_file_by_url(
         .with_context(|| format!("failed to create {}", config.output.display()))?;
     let dest = config.output.join(file_name);
 
+    // Count against the global download cap, like dataset files do.
+    let _permit = limits
+        .downloads
+        .clone()
+        .acquire_owned()
+        .await
+        .context("download semaphore closed unexpectedly")?;
     Pride::download_file(client, config, url, &dest, multi).await?;
     println!("Downloaded {file_name} -> {}", dest.display());
     Ok(())
@@ -388,6 +439,24 @@ async fn cmd_file_by_url(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Deduplicates the batch's download requests, keeping the first occurrence
+/// of each. With concurrent execution, two tasks fetching the same file would
+/// race on the same `.part` file, so duplicates must not run twice.
+fn dedupe_requests(requests: &[DownloadRequest]) -> Vec<&DownloadRequest> {
+    let mut seen = HashSet::new();
+    requests
+        .iter()
+        .filter(|request| {
+            if seen.insert((*request).clone()) {
+                true
+            } else {
+                warn!("duplicate download request skipped: {}", request.label());
+                false
+            }
+        })
+        .collect()
+}
 
 /// Installs `env_logger` bridged through `indicatif-log-bridge` so log lines
 /// don't garble the progress bars. Verbosity is controlled by the `-v` count
@@ -500,5 +569,29 @@ mod tests {
         };
         let text = help_with_hint(&resolved).unwrap();
         assert!(text.contains("my/pridl.toml was loaded but lists no downloads"));
+    }
+
+    #[test]
+    fn dedupe_requests_keeps_first_occurrence_of_each() {
+        let requests = vec![
+            DownloadRequest::Dataset("PXD000001".to_string()),
+            DownloadRequest::Url("https://x/y".to_string()),
+            DownloadRequest::Dataset("PXD000001".to_string()),
+            DownloadRequest::File {
+                accession: "PXD000001".to_string(),
+                file_name: "a.raw".to_string(),
+            },
+            DownloadRequest::Url("https://x/y".to_string()),
+        ];
+        let deduped = dedupe_requests(&requests);
+        assert_eq!(deduped.len(), 3);
+        assert_eq!(deduped[0].label(), "dataset PXD000001");
+        assert_eq!(deduped[1].label(), "url https://x/y");
+        assert_eq!(deduped[2].label(), "file PXD000001/a.raw");
+    }
+
+    #[test]
+    fn dedupe_requests_empty_batch_stays_empty() {
+        assert!(dedupe_requests(&[]).is_empty());
     }
 }

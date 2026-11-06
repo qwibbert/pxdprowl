@@ -84,6 +84,7 @@ impl Repository for Pride {
     async fn download_dataset(
         client: &reqwest::Client,
         config: &Config,
+        limits: &Arc<common::ConcurrencyLimits>,
         accession: &str,
         dest: &Path,
         multi: &MultiProgress,
@@ -99,10 +100,12 @@ impl Repository for Pride {
         dl_bar.set_style(common::count_style());
         dl_bar.set_prefix(format!("{accession} download"));
 
-        // Download missing files with limited concurrency. JoinSet processes
-        // results as they complete (not spawn order), so a slow resume doesn't
-        // block already-finished skips.
-        let sem = Arc::new(tokio::sync::Semaphore::new(config.download_concurrency));
+        // Download missing files with limited concurrency. The semaphore is
+        // shared across all datasets of the run, so `download_concurrency`
+        // stays a global cap. JoinSet processes results as they complete
+        // (not spawn order), so a slow resume doesn't block already-finished
+        // skips.
+        let sem = limits.downloads.clone();
         let mut set = tokio::task::JoinSet::new();
         for file in &files {
             let permit = sem
@@ -149,8 +152,17 @@ impl Repository for Pride {
             );
         }
 
-        // Validate checksums.
-        validate_checksums(client, config, accession, &output_dir, &files, multi).await?;
+        // Validate checksums (sharing the batch-wide validation limiter).
+        validate_checksums(
+            client,
+            config,
+            limits,
+            accession,
+            &output_dir,
+            &files,
+            multi,
+        )
+        .await?;
 
         Ok(files.len())
     }

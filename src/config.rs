@@ -65,7 +65,7 @@ pub struct ResolvedConfig {
 }
 
 /// One download action, from the config file or an equivalent subcommand.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum DownloadRequest {
     /// Download all RAW files of a dataset.

@@ -1,15 +1,19 @@
 //! Shared types, constants, and helpers for repository download/validation.
 
 use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
+    Arc, Mutex,
+    atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 
 use anyhow::{Context, Result};
 use indicatif::ProgressStyle;
-use log::warn;
+use log::{info, warn};
 use serde::Deserialize;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, Semaphore};
+use tokio::task::JoinHandle;
+use tokio::time::Instant;
+
+use crate::config::Config;
 
 /// Number of usable CPU cores (cgroup-aware, affinity-aware).
 pub fn cpu_count() -> usize {
@@ -122,6 +126,7 @@ pub fn count_style() -> ProgressStyle {
 /// A dynamically-resizable concurrency limiter. The `limit` field is adjusted
 /// at runtime by an AIMD controller based on measured throughput; `in_flight`
 /// tracks how many guards are currently held. Waiters sleep on `Notify`.
+#[derive(Debug)]
 pub struct AdaptiveLimiter {
     max: usize,
     limit: AtomicUsize,
@@ -202,6 +207,123 @@ impl Drop for AdaptiveGuard {
     }
 }
 
+/// Batch-wide concurrency limits shared by every download request of a run.
+///
+/// Created once per run with [`ConcurrencyLimits::new`] so that
+/// [`Config::download_concurrency`] and [`Config::validate_concurrency`] stay
+/// global caps even when multiple datasets are downloaded and validated
+/// concurrently. Clone the `Arc`s or share one `Arc<ConcurrencyLimits>` to
+/// pass the limits into spawned tasks.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct ConcurrencyLimits {
+    /// Global cap on in-flight file downloads across all datasets.
+    pub downloads: Arc<Semaphore>,
+    /// Global cap on in-flight MD5 validations across all datasets.
+    pub validations: Arc<AdaptiveLimiter>,
+    /// Aggregate bytes hashed so far, sampled by the AIMD controller.
+    pub(crate) bytes_hashed: Arc<AtomicU64>,
+    /// Whether the validation limiter is adaptive (AIMD) or fixed.
+    adaptive: bool,
+    /// Handle of the AIMD controller task, spawned lazily by
+    /// [`ConcurrencyLimits::start_aimd`] and aborted on drop.
+    aimd: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl ConcurrencyLimits {
+    /// Creates the shared limits for a run from `config`: one download
+    /// semaphore with `download_concurrency` permits, and one validation
+    /// limiter — fixed at `validate_concurrency`, or adaptive (AIMD) up to
+    /// the CPU count when unset.
+    pub fn new(config: &Config) -> Self {
+        let (initial, max) = match config.validate_concurrency {
+            Some(n) => (n, n),
+            None => (cpu_count().min(16), cpu_count()),
+        };
+        Self {
+            downloads: Arc::new(Semaphore::new(config.download_concurrency)),
+            validations: Arc::new(AdaptiveLimiter::new(initial, max)),
+            bytes_hashed: Arc::new(AtomicU64::new(0)),
+            adaptive: config.validate_concurrency.is_none(),
+            aimd: Mutex::new(None),
+        }
+    }
+
+    /// Spawns the AIMD controller for [`ConcurrencyLimits::validations`] once;
+    /// later calls are no-ops. Does nothing when a fixed validation
+    /// concurrency was configured. The controller runs until the limits are
+    /// dropped, adjusting the shared limiter based on the aggregate hash
+    /// throughput of all concurrent validations.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called outside a Tokio runtime (`tokio::spawn` requires one).
+    pub fn start_aimd(&self) {
+        if !self.adaptive {
+            return;
+        }
+        // The lock is only held for the (synchronous) spawn, never across an await.
+        let mut guard = self.aimd.lock().expect("aimd mutex poisoned");
+        if guard.is_some() {
+            return;
+        }
+        let ctrl = self.validations.clone();
+        let ctrl_bytes = self.bytes_hashed.clone();
+        *guard = Some(tokio::spawn(async move {
+            // On flat throughput, probe upward every PROBE_EVERY_FLAT-th sample
+            // so the limit can recover when external IO contention ends.
+            const PROBE_EVERY_FLAT: u32 = 5;
+            let mut prev_throughput = 0.0f64;
+            let mut last_bytes = 0u64;
+            let mut last = Instant::now();
+            let mut flat_count = 0u32;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                let now = Instant::now();
+                let cur = ctrl_bytes.load(Ordering::Relaxed);
+                let dt = now.duration_since(last).as_secs_f64();
+                let throughput = (cur.saturating_sub(last_bytes)) as f64 / dt.max(0.001);
+                if prev_throughput > 0.0 {
+                    if throughput > prev_throughput * 1.05 {
+                        // Rising — more parallelism helps, haven't found ceiling yet.
+                        ctrl.increase();
+                        flat_count = 0;
+                    } else if throughput < prev_throughput * 0.95 {
+                        // Dropping — overshot the IO ceiling, back off.
+                        ctrl.decrease();
+                        flat_count = 0;
+                    } else {
+                        // Flat (within ±5%) — at the ceiling, hold but probe
+                        // upward periodically to detect freed-up IO bandwidth.
+                        flat_count += 1;
+                        if flat_count >= PROBE_EVERY_FLAT {
+                            ctrl.increase();
+                            flat_count = 0;
+                        }
+                    }
+                }
+                info!(
+                    "validate AIMD: limit={}/{} throughput={:.1} MB/s",
+                    ctrl.current(),
+                    ctrl.max(),
+                    throughput / 1_000_000.0
+                );
+                prev_throughput = throughput;
+                last_bytes = cur;
+                last = now;
+            }
+        }));
+    }
+}
+
+impl Drop for ConcurrencyLimits {
+    fn drop(&mut self) {
+        if let Some(handle) = self.aimd.lock().expect("aimd mutex poisoned").take() {
+            handle.abort();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,5 +373,76 @@ mod tests {
         assert_eq!(file.file_category.unwrap().value, "RAW");
         assert_eq!(file.locations.len(), 1);
         assert_eq!(file.file_size, Some(123));
+    }
+
+    #[test]
+    fn concurrency_limits_use_config_caps() {
+        let config = Config {
+            download_concurrency: 3,
+            validate_concurrency: Some(2),
+            ..Config::default()
+        };
+        let limits = ConcurrencyLimits::new(&config);
+        assert_eq!(limits.downloads.available_permits(), 3);
+        assert_eq!(limits.validations.current(), 2);
+        assert_eq!(limits.validations.max(), 2);
+        assert!(!limits.adaptive);
+    }
+
+    #[test]
+    fn concurrency_limits_default_to_adaptive_validation() {
+        let limits = ConcurrencyLimits::new(&Config::default());
+        assert!(limits.adaptive);
+        assert_eq!(limits.validations.max(), cpu_count());
+        assert_eq!(limits.validations.current(), cpu_count().min(16));
+    }
+
+    #[tokio::test]
+    async fn start_aimd_skipped_for_fixed_validation_concurrency() {
+        let config = Config {
+            validate_concurrency: Some(4),
+            ..Config::default()
+        };
+        let limits = ConcurrencyLimits::new(&config);
+        limits.start_aimd();
+        assert!(limits.aimd.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn start_aimd_spawns_controller_only_once() {
+        let limits = ConcurrencyLimits::new(&Config::default());
+        limits.start_aimd();
+        let first = limits.aimd.lock().unwrap().as_ref().map(|h| h.id());
+        limits.start_aimd();
+        let second = limits.aimd.lock().unwrap().as_ref().map(|h| h.id());
+        assert!(first.is_some());
+        assert_eq!(first, second);
+    }
+
+    #[tokio::test]
+    async fn shared_validation_limiter_caps_in_flight_acquires() {
+        let config = Config {
+            validate_concurrency: Some(2),
+            ..Config::default()
+        };
+        let limits = Arc::new(ConcurrencyLimits::new(&config));
+        let g1 = limits.validations.acquire().await;
+        let g2 = limits.validations.acquire().await;
+        // Third acquire must wait until a guard is dropped.
+        let third = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            limits.validations.acquire(),
+        )
+        .await;
+        assert!(third.is_err());
+        drop(g1);
+        let third = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            limits.validations.acquire(),
+        )
+        .await;
+        assert!(third.is_ok());
+        drop(g2);
+        drop(third.unwrap());
     }
 }

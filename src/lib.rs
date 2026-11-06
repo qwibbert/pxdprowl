@@ -19,6 +19,7 @@ pub mod pride;
 pub mod repository;
 pub mod validate;
 
+pub use common::ConcurrencyLimits;
 pub use config::{CliOverrides, Config, DownloadRequest, ResolvedConfig};
 pub use pride::Pride;
 pub use repository::Repository;

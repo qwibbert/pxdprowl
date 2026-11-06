@@ -1,6 +1,7 @@
 //! The [`Repository`] trait abstracting a dataset repository.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::Result;
 use indicatif::MultiProgress;
@@ -45,6 +46,11 @@ pub trait Repository {
     /// `dest/{accession}/` and validates their checksums. Returns the
     /// number of files in the dataset.
     ///
+    /// `limits` holds the batch-wide concurrency caps shared with every other
+    /// dataset of the run, so `download_concurrency` and
+    /// `validate_concurrency` remain global limits when several datasets are
+    /// downloaded concurrently.
+    ///
     /// # Errors
     ///
     /// Returns an error if any file fails to download or any checksum
@@ -52,6 +58,7 @@ pub trait Repository {
     async fn download_dataset(
         client: &reqwest::Client,
         config: &Config,
+        limits: &Arc<common::ConcurrencyLimits>,
         accession: &str,
         dest: &Path,
         multi: &MultiProgress,

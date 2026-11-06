@@ -14,14 +14,14 @@ use anyhow::{Context, Result};
 use indicatif::{MultiProgress, ProgressBar};
 use log::{info, warn};
 use md5::{Digest, Md5};
-use tokio::time::Instant;
 
 use super::common;
 use super::config::Config;
 
 /// Downloads the PRIDE checksum TSV and validates MD5 of each downloaded file
-/// in parallel (limited by [`Config::validate_concurrency`], or adaptively
-/// when unset), since MD5 is CPU-bound.
+/// in parallel, since MD5 is CPU-bound. Concurrency is capped by the shared
+/// `limits` (fixed at [`Config::validate_concurrency`], or adaptively when
+/// unset), so the cap stays global when several datasets validate at once.
 /// Files with a mismatching checksum are deleted so the next run re-downloads
 /// them.
 ///
@@ -33,6 +33,7 @@ use super::config::Config;
 pub async fn validate_checksums(
     client: &reqwest::Client,
     config: &Config,
+    limits: &Arc<common::ConcurrencyLimits>,
     accession: &str,
     output_dir: &Path,
     files: &[common::PrideFile],
@@ -70,73 +71,13 @@ pub async fn validate_checksums(
     val_bar.set_style(common::count_style());
     val_bar.set_prefix(format!("{accession} validating"));
 
-    // Concurrency: fixed override via config.validate_concurrency, otherwise
-    // AIMD (adaptive limiter starting at min(cpu, 16), max cpu_count). The
-    // AIMD controller samples aggregate hash throughput and adjusts the limit.
-    let bytes_hashed = Arc::new(AtomicU64::new(0));
-    let (limiter, fixed_limit): (Arc<common::AdaptiveLimiter>, Option<usize>) =
-        match config.validate_concurrency {
-            Some(n) => (Arc::new(common::AdaptiveLimiter::new(n, n)), Some(n)),
-            None => (
-                Arc::new(common::AdaptiveLimiter::new(
-                    common::cpu_count().min(16),
-                    common::cpu_count(),
-                )),
-                None,
-            ),
-        };
-
-    // Spawn AIMD controller unless a fixed limit was requested.
-    let aimd_handle = if fixed_limit.is_none() {
-        // On flat throughput, probe upward every PROBE_EVERY_FLAT-th sample
-        // so the limit can recover when external IO contention ends.
-        const PROBE_EVERY_FLAT: u32 = 5;
-        let ctrl = limiter.clone();
-        let ctrl_bytes = bytes_hashed.clone();
-        Some(tokio::spawn(async move {
-            let mut prev_throughput = 0.0f64;
-            let mut last_bytes = 0u64;
-            let mut last = Instant::now();
-            let mut flat_count = 0u32;
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                let now = Instant::now();
-                let cur = ctrl_bytes.load(Ordering::Relaxed);
-                let dt = now.duration_since(last).as_secs_f64();
-                let throughput = (cur.saturating_sub(last_bytes)) as f64 / dt.max(0.001);
-                if prev_throughput > 0.0 {
-                    if throughput > prev_throughput * 1.05 {
-                        // Rising — more parallelism helps, haven't found ceiling yet.
-                        ctrl.increase();
-                        flat_count = 0;
-                    } else if throughput < prev_throughput * 0.95 {
-                        // Dropping — overshot the IO ceiling, back off.
-                        ctrl.decrease();
-                        flat_count = 0;
-                    } else {
-                        // Flat (within ±5%) — at the ceiling, hold but probe
-                        // upward periodically to detect freed-up IO bandwidth.
-                        flat_count += 1;
-                        if flat_count >= PROBE_EVERY_FLAT {
-                            ctrl.increase();
-                            flat_count = 0;
-                        }
-                    }
-                }
-                info!(
-                    "validate AIMD: limit={}/{} throughput={:.1} MB/s",
-                    ctrl.current(),
-                    ctrl.max(),
-                    throughput / 1_000_000.0
-                );
-                prev_throughput = throughput;
-                last_bytes = cur;
-                last = now;
-            }
-        }))
-    } else {
-        None
-    };
+    // Concurrency: the limiter is shared across all datasets of the run (fixed
+    // at config.validate_concurrency, or adaptive otherwise). The AIMD
+    // controller samples aggregate hash throughput and adjusts the shared
+    // limit; it is spawned once and lives until `limits` is dropped.
+    let limiter = limits.validations.clone();
+    let bytes_hashed = limits.bytes_hashed.clone();
+    limits.start_aimd();
 
     // Spawn one task per file, gated by the adaptive limiter. Each task
     // offloads the CPU-bound MD5 to spawn_blocking (async-spawn-blocking).
@@ -210,9 +151,6 @@ pub async fn validate_checksums(
         }
     }
     val_bar.finish_and_clear();
-    if let Some(h) = aimd_handle {
-        h.abort();
-    }
 
     if !failures.is_empty() {
         anyhow::bail!(
