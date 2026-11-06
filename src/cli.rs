@@ -218,6 +218,7 @@ pub async fn run(args: Args) -> Result<()> {
 /// Renders the long help plus a hint about subcommands / the config file,
 /// shown when `pridl` runs without a subcommand and with nothing to download.
 fn help_with_hint(resolved: &ResolvedConfig) -> Result<String> {
+    use std::fmt::Write as _;
     let mut cmd = Args::command();
     let mut buf = Vec::new();
     cmd.write_long_help(&mut buf)
@@ -225,17 +226,21 @@ fn help_with_hint(resolved: &ResolvedConfig) -> Result<String> {
     let mut text = String::from_utf8(buf).context("help output is not valid UTF-8")?;
     match &resolved.config_path {
         Some(path) => {
-            text.push_str(&format!(
+            write!(
+                text,
                 "\nHint: {} was loaded but lists no downloads. Add `datasets`, `files` or \
                  `urls` to it, or pass a subcommand.\n",
                 path.display()
-            ));
+            )
+            .context("failed to render hint")?;
         }
         None => {
-            text.push_str(&format!(
+            write!(
+                text,
                 "\nHint: pass a subcommand, or create a {CONFIG_FILE_NAME} with \
                  `datasets`/`files`/`urls` and run `pridl` without arguments.\n"
-            ));
+            )
+            .context("failed to render hint")?;
         }
     }
     Ok(text)
@@ -474,7 +479,7 @@ mod tests {
 
     fn resolved_without_config() -> ResolvedConfig {
         ResolvedConfig {
-            config: Config::defaults(),
+            config: Config::default(),
             downloads: vec![],
             config_path: None,
         }

@@ -35,7 +35,11 @@ pub const ENV_VALIDATE_CONCURRENCY: &str = "PRIDL_VALIDATE_CONCURRENCY";
 pub const ENV_MAX_RETRIES: &str = "PRIDL_MAX_RETRIES";
 
 /// Resolved runtime settings, passed explicitly through the library.
+///
+/// Construct via [`Config::default`] and mutate the fields, or let the
+/// binary resolve it from CLI/env/config file with [`Config::resolve`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Config {
     /// Directory downloaded files are stored in.
     pub output: PathBuf,
@@ -50,6 +54,7 @@ pub struct Config {
 /// The result of [`Config::resolve`]: the settings plus the download plan
 /// listed in the config file.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ResolvedConfig {
     /// The resolved settings.
     pub config: Config,
@@ -61,6 +66,7 @@ pub struct ResolvedConfig {
 
 /// One download action, from the config file or an equivalent subcommand.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DownloadRequest {
     /// Download all RAW files of a dataset.
     Dataset(String),
@@ -91,6 +97,7 @@ impl DownloadRequest {
 
 /// Per-setting overrides coming from the command line (`None` = not given).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CliOverrides {
     /// `--config PATH`
     pub config: Option<PathBuf>,
@@ -193,9 +200,9 @@ impl EnvOverrides {
     }
 }
 
-impl Config {
+impl Default for Config {
     /// Built-in defaults, derived from the machine where applicable.
-    pub fn defaults() -> Self {
+    fn default() -> Self {
         Self {
             output: PathBuf::from(DEFAULT_OUTPUT),
             download_concurrency: (cpu_count() * 2).min(8),
@@ -203,7 +210,9 @@ impl Config {
             max_retries: 5,
         }
     }
+}
 
+impl Config {
     /// Resolves the effective configuration and download plan: CLI overrides
     /// win over the `PRIDL_*` env vars, which win over the config file
     /// (`--config PATH`, else `./pridl.toml` when present), which wins over
@@ -242,7 +251,7 @@ impl Config {
         env: &EnvOverrides,
         config_dir: Option<&Path>,
     ) -> Result<Config> {
-        let defaults = Self::defaults();
+        let defaults = Self::default();
         // An `output` from the config file is resolved relative to the config
         // file's directory; CLI/env paths stay relative to the current dir.
         let output = match cli.output.clone().or_else(|| env.output.clone()) {
@@ -358,7 +367,7 @@ mod tests {
 
     #[test]
     fn defaults_are_sane() {
-        let c = Config::defaults();
+        let c = Config::default();
         assert_eq!(c.output, PathBuf::from(DEFAULT_OUTPUT));
         assert!(c.download_concurrency > 0);
         assert_eq!(c.validate_concurrency, None);
@@ -417,7 +426,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(c, Config::defaults());
+        assert_eq!(c, Config::default());
     }
 
     #[test]
@@ -525,7 +534,7 @@ mod tests {
         let dir = temp_dir("empty");
         let resolved = Config::resolve_from(&dir, &CliOverrides::default()).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
-        assert_eq!(resolved.config, Config::defaults());
+        assert_eq!(resolved.config, Config::default());
         assert!(resolved.downloads.is_empty());
         assert_eq!(resolved.config_path, None);
     }

@@ -87,13 +87,9 @@ where
         match op().await {
             Ok(v) => return Ok(v),
             Err(e) if attempt < max_retries => {
-                let backoff = std::time::Duration::from_secs(
-                    2u64.pow(
-                        (attempt - 1)
-                            .try_into()
-                            .expect("max_retries should be no larger than u32 allows"),
-                    ),
-                );
+                // Saturate instead of panicking on absurdly large max_retries.
+                let exp = u32::try_from(attempt - 1).unwrap_or(u32::MAX);
+                let backoff = std::time::Duration::from_secs(2u64.saturating_pow(exp));
                 warn!(
                     "{what}: attempt {attempt}/{max_retries} failed: {e:#}. Retrying in {backoff:?}"
                 );

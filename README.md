@@ -77,14 +77,13 @@ $ pridl file url https://ftp.pride.ebi.ac.uk/.../sample.raw
 ```
 
 ## Library use
-Library users skip the config file and env vars entirely by constructing
-`pridl::Config` directly:
+Library users skip the config file and env vars entirely by starting from
+`pridl::Config::default()` and adjusting fields:
 
 ```rust,ignore
-let config = pridl::Config {
-    output: "data".into(),
-    download_concurrency: 4,
-    validate_concurrency: Some(8),
-    max_retries: 3,
-};
+let mut config = pridl::Config::default();
+config.output = "data".into();
+config.download_concurrency = 4;
+config.validate_concurrency = Some(8);
+config.max_retries = 3;
 ```
