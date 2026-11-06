@@ -3,15 +3,15 @@
 //! Defines the clap argument structure and the [`run`] dispatcher that
 //! executes each subcommand against the PRIDE archive.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
-use indicatif::MultiProgress;
-use log::info;
+use clap::{CommandFactory, Parser, Subcommand};
+use indicatif::{MultiProgress, ProgressBar};
+use log::{info, warn};
 
 use crate::common;
-use crate::config::{CliOverrides, Config};
+use crate::config::{CONFIG_FILE_NAME, CliOverrides, Config, DownloadRequest, ResolvedConfig};
 use crate::{Pride, Repository};
 
 // ---------------------------------------------------------------------------
@@ -19,13 +19,19 @@ use crate::{Pride, Repository};
 // ---------------------------------------------------------------------------
 
 /// Download datasets and files from the PRIDE proteomics archive.
+///
+/// With no subcommand, the downloads listed in the config file are run.
 #[derive(Parser, Debug)]
 #[command(name = "pride-rs", version, about, long_about = None)]
 pub struct Args {
-    /// Directory to store downloaded files. A `pridl.toml` in this directory
-    /// is used as the config file (see the README).
-    #[arg(short, long, default_value = "datasets", global = true)]
-    pub output: PathBuf,
+    /// Path to the config file. Defaults to ./pridl.toml when present.
+    #[arg(short, long, global = true, value_name = "PATH")]
+    pub config: Option<PathBuf>,
+
+    /// Directory to store downloaded files. Overrides PRIDL_OUTPUT and the
+    /// `output` key in the config file. Defaults to `datasets`.
+    #[arg(short, long, global = true, value_name = "DIR")]
+    pub output: Option<PathBuf>,
 
     /// Increase logging verbosity (-v info, -vv debug, -vvv trace).
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
@@ -47,7 +53,7 @@ pub struct Args {
     pub max_retries: Option<usize>,
 
     #[command(subcommand)]
-    pub command: Commands,
+    pub command: Option<Commands>,
 }
 
 /// The available subcommands.
@@ -95,30 +101,32 @@ pub enum FileSource {
 // Entry point
 // ---------------------------------------------------------------------------
 
-/// Parses CLI args (done by the caller) and runs the requested subcommand.
+/// Parses CLI args (done by the caller) and runs the requested subcommand —
+/// or, when no subcommand is given, the downloads listed in the config file.
+/// With neither, prints the help plus a hint instead of failing.
 ///
-/// Sets up logging, the HTTP client, and the progress-bar display, then
-/// dispatches to the appropriate command handler.
+/// Sets up logging, resolves the configuration, builds the HTTP client and
+/// the progress-bar display, then dispatches to the command handlers.
 ///
 /// # Errors
 ///
-/// Returns an error if the logger cannot be installed, the HTTP client
-/// cannot be built, or the subcommand fails.
+/// Returns an error if the logger cannot be installed, the configuration is
+/// invalid, the HTTP client cannot be built, or a download fails.
 pub async fn run(args: Args) -> Result<()> {
     let multi = MultiProgress::new();
     init_logging(&multi, args.verbose)?;
 
-    // Resolve settings: CLI flags > PRIDL_* env vars > pridl.toml in the
-    // output directory > built-in defaults.
-    let config = Config::resolve(
-        &args.output,
-        CliOverrides {
-            download_concurrency: args.download_concurrency,
-            validate_concurrency: args.validate_concurrency,
-            max_retries: args.max_retries,
-        },
-    )
+    // Resolve settings and download plan: CLI flags > PRIDL_* env vars >
+    // config file (--config, else ./pridl.toml) > built-in defaults.
+    let resolved = Config::resolve(&CliOverrides {
+        config: args.config.clone(),
+        output: args.output.clone(),
+        download_concurrency: args.download_concurrency,
+        validate_concurrency: args.validate_concurrency,
+        max_retries: args.max_retries,
+    })
     .context("invalid configuration")?;
+    let config = &resolved.config;
 
     let client = reqwest::Client::builder()
         .connect_timeout(common::DOWNLOAD_CONNECT_TIMEOUT)
@@ -126,7 +134,8 @@ pub async fn run(args: Args) -> Result<()> {
         .context("failed to build HTTP client")?;
 
     info!(
-        "Config: download-concurrency={}, validate-concurrency={}, max-retries={} ({} CPUs)",
+        "Config: output={}, download-concurrency={}, validate-concurrency={}, max-retries={} ({} CPUs)",
+        config.output.display(),
         config.download_concurrency,
         config
             .validate_concurrency
@@ -135,22 +144,118 @@ pub async fn run(args: Args) -> Result<()> {
         common::cpu_count()
     );
 
+    if args.command.is_some() {
+        hint_subcommand_overrides_config(&resolved);
+    }
+
     match &args.command {
-        Commands::Dataset { accession } => {
-            cmd_dataset(&client, &config, accession, &args.output, &multi).await
+        // Listing is not a download; run it directly.
+        Some(Commands::Files { accession }) => cmd_files(&client, config, accession).await,
+        Some(command) => {
+            let action = match command {
+                Commands::Dataset { accession } => DownloadRequest::Dataset(accession.clone()),
+                Commands::File {
+                    source:
+                        FileSource::Name {
+                            accession,
+                            file_name,
+                        },
+                } => DownloadRequest::File {
+                    accession: accession.clone(),
+                    file_name: file_name.clone(),
+                },
+                Commands::File {
+                    source: FileSource::Url { url },
+                } => DownloadRequest::Url(url.clone()),
+                Commands::Files { .. } => unreachable!("Files is dispatched above"),
+            };
+            cmd_download(&client, config, &action, &multi).await
         }
-        Commands::Files { accession } => cmd_files(&client, &config, accession).await,
-        Commands::File { source } => match source {
-            FileSource::Name {
-                accession,
-                file_name,
-            } => {
-                cmd_file_by_name(&client, &config, accession, file_name, &args.output, &multi).await
+        None => {
+            if resolved.downloads.is_empty() {
+                // Nothing to do: show the help plus a hint instead of erroring.
+                use std::io::Write as _;
+                let mut stdout = std::io::stdout().lock();
+                stdout
+                    .write_all(help_with_hint(&resolved)?.as_bytes())
+                    .context("failed to print help")?;
+                return Ok(());
             }
-            FileSource::Url { url } => {
-                cmd_file_by_url(&client, &config, url, &args.output, &multi).await
+            // Batch from the config file: run every request, collect failures,
+            // and summarize at the end instead of stopping at the first one.
+            // With multiple requests, show an overall count bar on top of the
+            // per-request bars.
+            let overall = (resolved.downloads.len() > 1).then(|| {
+                let bar = multi.add(ProgressBar::new(resolved.downloads.len() as u64));
+                bar.set_style(common::count_style());
+                bar.set_prefix("Downloads");
+                bar
+            });
+            let mut failed = Vec::new();
+            for request in &resolved.downloads {
+                let label = request.label();
+                info!("starting {label}");
+                if let Err(e) = cmd_download(&client, config, request, &multi).await {
+                    warn!("{label} failed: {e:#}");
+                    failed.push(label);
+                }
+                if let Some(bar) = &overall {
+                    bar.inc(1);
+                }
             }
-        },
+            if let Some(bar) = &overall {
+                bar.finish_and_clear();
+            }
+            if failed.is_empty() {
+                Ok(())
+            } else {
+                bail!("{} download(s) failed: {}", failed.len(), failed.join(", "))
+            }
+        }
+    }
+}
+
+/// Renders the long help plus a hint about subcommands / the config file,
+/// shown when `pridl` runs without a subcommand and with nothing to download.
+fn help_with_hint(resolved: &ResolvedConfig) -> Result<String> {
+    let mut cmd = Args::command();
+    let mut buf = Vec::new();
+    cmd.write_long_help(&mut buf)
+        .context("failed to render help")?;
+    let mut text = String::from_utf8(buf).context("help output is not valid UTF-8")?;
+    match &resolved.config_path {
+        Some(path) => {
+            text.push_str(&format!(
+                "\nHint: {} was loaded but lists no downloads. Add `datasets`, `files` or \
+                 `urls` to it, or pass a subcommand.\n",
+                path.display()
+            ));
+        }
+        None => {
+            text.push_str(&format!(
+                "\nHint: pass a subcommand, or create a {CONFIG_FILE_NAME} with \
+                 `datasets`/`files`/`urls` and run `pridl` without arguments.\n"
+            ));
+        }
+    }
+    Ok(text)
+}
+
+/// When a subcommand is given, the config file's download lists don't apply.
+/// Show a hint instead of silently ignoring them (the file's settings still
+/// apply).
+fn hint_subcommand_overrides_config(resolved: &ResolvedConfig) {
+    let Some(path) = &resolved.config_path else {
+        return;
+    };
+    if resolved.downloads.is_empty() {
+        warn!("using settings from {}", path.display());
+    } else {
+        warn!(
+            "a subcommand was given, so the {} download(s) listed in {} are ignored (its settings still apply)",
+            resolved.downloads.len(),
+            path.display()
+        );
     }
 }
 
@@ -158,21 +263,37 @@ pub async fn run(args: Args) -> Result<()> {
 // Command handlers
 // ---------------------------------------------------------------------------
 
+/// Runs a single download action (from a subcommand or the config file).
+async fn cmd_download(
+    client: &reqwest::Client,
+    config: &Config,
+    request: &DownloadRequest,
+    multi: &MultiProgress,
+) -> Result<()> {
+    match request {
+        DownloadRequest::Dataset(accession) => cmd_dataset(client, config, accession, multi).await,
+        DownloadRequest::File {
+            accession,
+            file_name,
+        } => cmd_file_by_name(client, config, accession, file_name, multi).await,
+        DownloadRequest::Url(url) => cmd_file_by_url(client, config, url, multi).await,
+    }
+}
+
 /// Downloads every RAW file of `accession` into `output/{accession}/` and
 /// validates checksums.
 async fn cmd_dataset(
     client: &reqwest::Client,
     config: &Config,
     accession: &str,
-    output: &Path,
     multi: &MultiProgress,
 ) -> Result<()> {
-    let count = Pride::download_dataset(client, config, accession, output, multi)
+    let count = Pride::download_dataset(client, config, accession, &config.output, multi)
         .await
         .with_context(|| format!("failed to download dataset {accession}"))?;
     println!(
         "Downloaded {count} file(s) for {accession} into {}",
-        output.join(accession).display()
+        config.output.join(accession).display()
     );
     Ok(())
 }
@@ -208,7 +329,6 @@ async fn cmd_file_by_name(
     config: &Config,
     accession: &str,
     file_name: &str,
-    output: &Path,
     multi: &MultiProgress,
 ) -> Result<()> {
     let files = Pride::get_file_list(client, config, accession)
@@ -225,7 +345,7 @@ async fn cmd_file_by_name(
         bail!("no downloadable HTTPS URL for '{file_name}' in {accession}");
     }
 
-    let dest_dir = output.join(accession);
+    let dest_dir = config.output.join(accession);
     tokio::fs::create_dir_all(&dest_dir)
         .await
         .with_context(|| format!("failed to create {}", dest_dir.display()))?;
@@ -241,7 +361,6 @@ async fn cmd_file_by_url(
     client: &reqwest::Client,
     config: &Config,
     url: &str,
-    output: &Path,
     multi: &MultiProgress,
 ) -> Result<()> {
     let parsed = reqwest::Url::parse(url).with_context(|| format!("invalid URL: {url}"))?;
@@ -251,10 +370,10 @@ async fn cmd_file_by_url(
         .filter(|s| !s.is_empty())
         .unwrap_or("download");
 
-    tokio::fs::create_dir_all(output)
+    tokio::fs::create_dir_all(&config.output)
         .await
-        .with_context(|| format!("failed to create {}", output.display()))?;
-    let dest = output.join(file_name);
+        .with_context(|| format!("failed to create {}", config.output.display()))?;
+    let dest = config.output.join(file_name);
 
     Pride::download_file(client, config, url, &dest, multi).await?;
     println!("Downloaded {file_name} -> {}", dest.display());
@@ -326,5 +445,55 @@ mod tests {
     fn args_help_parses() {
         use clap::CommandFactory;
         Args::command().debug_assert();
+    }
+
+    #[test]
+    fn args_parse_without_subcommand() {
+        let args = Args::try_parse_from(["pridl"]).unwrap();
+        assert!(args.command.is_none());
+        assert!(args.config.is_none());
+        assert!(args.output.is_none());
+    }
+
+    #[test]
+    fn args_parse_config_and_output_flags() {
+        let args = Args::try_parse_from([
+            "pridl",
+            "-c",
+            "my.toml",
+            "-o",
+            "out",
+            "dataset",
+            "PXD000001",
+        ])
+        .unwrap();
+        assert_eq!(args.config, Some(PathBuf::from("my.toml")));
+        assert_eq!(args.output, Some(PathBuf::from("out")));
+        assert!(matches!(args.command, Some(Commands::Dataset { .. })));
+    }
+
+    fn resolved_without_config() -> ResolvedConfig {
+        ResolvedConfig {
+            config: Config::defaults(),
+            downloads: vec![],
+            config_path: None,
+        }
+    }
+
+    #[test]
+    fn help_hint_without_config_suggests_creating_one() {
+        let text = help_with_hint(&resolved_without_config()).unwrap();
+        assert!(text.contains("Usage:"));
+        assert!(text.contains("Hint: pass a subcommand, or create a pridl.toml"));
+    }
+
+    #[test]
+    fn help_hint_with_config_names_the_loaded_file() {
+        let resolved = ResolvedConfig {
+            config_path: Some(PathBuf::from("my/pridl.toml")),
+            ..resolved_without_config()
+        };
+        let text = help_with_hint(&resolved).unwrap();
+        assert!(text.contains("my/pridl.toml was loaded but lists no downloads"));
     }
 }
