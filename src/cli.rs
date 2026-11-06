@@ -11,6 +11,7 @@ use indicatif::MultiProgress;
 use log::info;
 
 use crate::common;
+use crate::config::{CliOverrides, Config};
 use crate::{Pride, Repository};
 
 // ---------------------------------------------------------------------------
@@ -21,13 +22,29 @@ use crate::{Pride, Repository};
 #[derive(Parser, Debug)]
 #[command(name = "pride-rs", version, about, long_about = None)]
 pub struct Args {
-    /// Directory to store downloaded files.
+    /// Directory to store downloaded files. A `pridl.toml` in this directory
+    /// is used as the config file (see the README).
     #[arg(short, long, default_value = "datasets", global = true)]
     pub output: PathBuf,
 
     /// Increase logging verbosity (-v info, -vv debug, -vvv trace).
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
     pub verbose: u8,
+
+    /// Maximum number of files downloaded in parallel.
+    /// Overrides PRIDL_DOWNLOAD_CONCURRENCY and pridl.toml.
+    #[arg(long, global = true, value_name = "N")]
+    pub download_concurrency: Option<usize>,
+
+    /// Fixed number of parallel checksum validations (disables the adaptive
+    /// limiter). Overrides PRIDL_VALIDATE_CONCURRENCY and pridl.toml.
+    #[arg(long, global = true, value_name = "N")]
+    pub validate_concurrency: Option<usize>,
+
+    /// Maximum number of attempts for retryable operations.
+    /// Overrides PRIDL_MAX_RETRIES and pridl.toml.
+    #[arg(long, global = true, value_name = "N")]
+    pub max_retries: Option<usize>,
 
     #[command(subcommand)]
     pub command: Commands,
@@ -91,29 +108,48 @@ pub async fn run(args: Args) -> Result<()> {
     let multi = MultiProgress::new();
     init_logging(&multi, args.verbose)?;
 
+    // Resolve settings: CLI flags > PRIDL_* env vars > pridl.toml in the
+    // output directory > built-in defaults.
+    let config = Config::resolve(
+        &args.output,
+        CliOverrides {
+            download_concurrency: args.download_concurrency,
+            validate_concurrency: args.validate_concurrency,
+            max_retries: args.max_retries,
+        },
+    )
+    .context("invalid configuration")?;
+
     let client = reqwest::Client::builder()
         .connect_timeout(common::DOWNLOAD_CONNECT_TIMEOUT)
         .build()
         .context("failed to build HTTP client")?;
 
     info!(
-        "Concurrency: download={}, validate={} ({} CPUs)",
-        *common::DOWNLOAD_CONCURRENCY,
-        common::VALIDATE_CONCURRENCY.map_or_else(|| "aimd".to_string(), |n| n.to_string()),
+        "Config: download-concurrency={}, validate-concurrency={}, max-retries={} ({} CPUs)",
+        config.download_concurrency,
+        config
+            .validate_concurrency
+            .map_or_else(|| "aimd".to_string(), |n| n.to_string()),
+        config.max_retries,
         common::cpu_count()
     );
 
     match &args.command {
         Commands::Dataset { accession } => {
-            cmd_dataset(&client, accession, &args.output, &multi).await
+            cmd_dataset(&client, &config, accession, &args.output, &multi).await
         }
-        Commands::Files { accession } => cmd_files(&client, accession).await,
+        Commands::Files { accession } => cmd_files(&client, &config, accession).await,
         Commands::File { source } => match source {
             FileSource::Name {
                 accession,
                 file_name,
-            } => cmd_file_by_name(&client, accession, file_name, &args.output, &multi).await,
-            FileSource::Url { url } => cmd_file_by_url(&client, url, &args.output, &multi).await,
+            } => {
+                cmd_file_by_name(&client, &config, accession, file_name, &args.output, &multi).await
+            }
+            FileSource::Url { url } => {
+                cmd_file_by_url(&client, &config, url, &args.output, &multi).await
+            }
         },
     }
 }
@@ -126,11 +162,12 @@ pub async fn run(args: Args) -> Result<()> {
 /// validates checksums.
 async fn cmd_dataset(
     client: &reqwest::Client,
+    config: &Config,
     accession: &str,
     output: &Path,
     multi: &MultiProgress,
 ) -> Result<()> {
-    let count = Pride::download_dataset(client, accession, output, multi)
+    let count = Pride::download_dataset(client, config, accession, output, multi)
         .await
         .with_context(|| format!("failed to download dataset {accession}"))?;
     println!(
@@ -141,8 +178,8 @@ async fn cmd_dataset(
 }
 
 /// Prints the RAW file list for `accession`.
-async fn cmd_files(client: &reqwest::Client, accession: &str) -> Result<()> {
-    let files = Pride::get_file_list(client, accession)
+async fn cmd_files(client: &reqwest::Client, config: &Config, accession: &str) -> Result<()> {
+    let files = Pride::get_file_list(client, config, accession)
         .await
         .with_context(|| format!("failed to fetch file list for {accession}"))?;
 
@@ -168,12 +205,13 @@ async fn cmd_files(client: &reqwest::Client, accession: &str) -> Result<()> {
 /// Downloads a single file identified by `accession` + `file_name`.
 async fn cmd_file_by_name(
     client: &reqwest::Client,
+    config: &Config,
     accession: &str,
     file_name: &str,
     output: &Path,
     multi: &MultiProgress,
 ) -> Result<()> {
-    let files = Pride::get_file_list(client, accession)
+    let files = Pride::get_file_list(client, config, accession)
         .await
         .with_context(|| format!("failed to fetch file list for {accession}"))?;
 
@@ -193,7 +231,7 @@ async fn cmd_file_by_name(
         .with_context(|| format!("failed to create {}", dest_dir.display()))?;
     let dest = dest_dir.join(file_name);
 
-    Pride::download_file(client, &url, &dest, multi).await?;
+    Pride::download_file(client, config, &url, &dest, multi).await?;
     println!("Downloaded {file_name} -> {}", dest.display());
     Ok(())
 }
@@ -201,6 +239,7 @@ async fn cmd_file_by_name(
 /// Downloads a single file directly from `url`.
 async fn cmd_file_by_url(
     client: &reqwest::Client,
+    config: &Config,
     url: &str,
     output: &Path,
     multi: &MultiProgress,
@@ -217,7 +256,7 @@ async fn cmd_file_by_url(
         .with_context(|| format!("failed to create {}", output.display()))?;
     let dest = output.join(file_name);
 
-    Pride::download_file(client, url, &dest, multi).await?;
+    Pride::download_file(client, config, url, &dest, multi).await?;
     println!("Downloaded {file_name} -> {}", dest.display());
     Ok(())
 }

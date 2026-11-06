@@ -6,6 +6,7 @@ use anyhow::Result;
 use indicatif::MultiProgress;
 
 use super::common;
+use super::config::Config;
 
 /// A remote dataset repository that can list and download datasets.
 ///
@@ -16,10 +17,11 @@ pub trait Repository {
     ///
     /// # Errors
     ///
-    /// Returns an error if the request fails after all retries or the
-    /// response cannot be parsed.
+    /// Returns an error if the request fails after `config.max_retries`
+    /// attempts or the response cannot be parsed.
     async fn get_file_list(
         client: &reqwest::Client,
+        config: &Config,
         accession: &str,
     ) -> Result<Vec<common::PrideFile>>;
 
@@ -29,10 +31,11 @@ pub trait Repository {
     ///
     /// # Errors
     ///
-    /// Returns an error if the file cannot be fully downloaded after `MAX_RETRIES`, 
-    // or if the final rename fails.
+    /// Returns an error if the file cannot be fully downloaded after
+    /// `config.max_retries` attempts, or if the final rename fails.
     async fn download_file(
         client: &reqwest::Client,
+        config: &Config,
         url: &str,
         dest: &Path,
         multi: &MultiProgress,
@@ -48,6 +51,7 @@ pub trait Repository {
     /// validation fails.
     async fn download_dataset(
         client: &reqwest::Client,
+        config: &Config,
         accession: &str,
         dest: &Path,
         multi: &MultiProgress,

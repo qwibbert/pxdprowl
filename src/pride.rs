@@ -9,6 +9,7 @@ use log::{info, warn};
 use tokio::io::AsyncWriteExt;
 
 use super::common;
+use super::config::Config;
 use super::repository::Repository;
 use super::validate_checksums;
 
@@ -18,27 +19,29 @@ pub struct Pride;
 impl Repository for Pride {
     async fn get_file_list(
         client: &reqwest::Client,
+        config: &Config,
         accession: &str,
     ) -> Result<Vec<common::PrideFile>> {
         let url = format!("{}/projects/{accession}/files/all", common::PRIDE_API_BASE);
         let what = format!("fetch file list for {accession}");
-        let files: Vec<common::PrideFile> = common::retry_with_backoff(&what, || {
-            let client = client.clone();
-            let url = url.clone();
-            async move {
-                client
-                    .get(&url)
-                    .header("Accept", "application/json")
-                    .timeout(common::API_TIMEOUT)
-                    .send()
-                    .await
-                    .with_context(|| format!("failed to fetch file list for {accession}"))?
-                    .json()
-                    .await
-                    .with_context(|| format!("failed to parse file list JSON for {accession}"))
-            }
-        })
-        .await?;
+        let files: Vec<common::PrideFile> =
+            common::retry_with_backoff(&what, config.max_retries, || {
+                let client = client.clone();
+                let url = url.clone();
+                async move {
+                    client
+                        .get(&url)
+                        .header("Accept", "application/json")
+                        .timeout(common::API_TIMEOUT)
+                        .send()
+                        .await
+                        .with_context(|| format!("failed to fetch file list for {accession}"))?
+                        .json()
+                        .await
+                        .with_context(|| format!("failed to parse file list JSON for {accession}"))
+                }
+            })
+            .await?;
 
         Ok(files
             .into_iter()
@@ -48,6 +51,7 @@ impl Repository for Pride {
 
     async fn download_file(
         client: &reqwest::Client,
+        config: &Config,
         url: &str,
         dest: &Path,
         multi: &MultiProgress,
@@ -64,7 +68,7 @@ impl Repository for Pride {
 
         let tmp = dest.with_extension("part");
         let what = file_name.clone();
-        common::retry_with_backoff(&what, || {
+        common::retry_with_backoff(&what, config.max_retries, || {
             let client = client.clone();
             let url = url.to_string();
             let dest = dest.to_path_buf();
@@ -79,11 +83,12 @@ impl Repository for Pride {
 
     async fn download_dataset(
         client: &reqwest::Client,
+        config: &Config,
         accession: &str,
         dest: &Path,
         multi: &MultiProgress,
     ) -> Result<usize> {
-        let files = Self::get_file_list(client, accession).await?;
+        let files = Self::get_file_list(client, config, accession).await?;
         info!("{accession}: {} RAW files listed", files.len());
 
         let output_dir = dest.join(accession);
@@ -97,7 +102,7 @@ impl Repository for Pride {
         // Download missing files with limited concurrency. JoinSet processes
         // results as they complete (not spawn order), so a slow resume doesn't
         // block already-finished skips.
-        let sem = Arc::new(tokio::sync::Semaphore::new(*common::DOWNLOAD_CONCURRENCY));
+        let sem = Arc::new(tokio::sync::Semaphore::new(config.download_concurrency));
         let mut set = tokio::task::JoinSet::new();
         for file in &files {
             let permit = sem
@@ -106,6 +111,7 @@ impl Repository for Pride {
                 .await
                 .context("semaphore closed unexpectedly")?;
             let client = client.clone();
+            let config = config.clone();
             let file_name = file.file_name.clone();
             let url = file.https_url();
             let dest = output_dir.join(&file_name);
@@ -113,7 +119,7 @@ impl Repository for Pride {
             let dl_bar = dl_bar.clone();
             set.spawn(async move {
                 let _permit = permit;
-                let result = Self::download_file(&client, &url, &dest, &multi).await;
+                let result = Self::download_file(&client, &config, &url, &dest, &multi).await;
                 dl_bar.inc(1);
                 (file_name, result)
             });
@@ -144,7 +150,7 @@ impl Repository for Pride {
         }
 
         // Validate checksums.
-        validate_checksums(client, accession, &output_dir, &files, multi).await?;
+        validate_checksums(client, config, accession, &output_dir, &files, multi).await?;
 
         Ok(files.len())
     }

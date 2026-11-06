@@ -17,18 +17,22 @@ use md5::{Digest, Md5};
 use tokio::time::Instant;
 
 use super::common;
+use super::config::Config;
 
 /// Downloads the PRIDE checksum TSV and validates MD5 of each downloaded file
-/// in parallel (limited by `VALIDATE_CONCURRENCY`), since MD5 is CPU-bound.
+/// in parallel (limited by [`Config::validate_concurrency`], or adaptively
+/// when unset), since MD5 is CPU-bound.
 /// Files with a mismatching checksum are deleted so the next run re-downloads
 /// them.
 ///
 /// # Errors
 ///
-/// Returns an error if the checksum TSV cannot be fetched after `MAX_RETRIES`,
-/// or if any file's checksum mismatches or cannot be computed.
+/// Returns an error if the checksum TSV cannot be fetched after
+/// `config.max_retries` attempts, or if any file's checksum mismatches or
+/// cannot be computed.
 pub async fn validate_checksums(
     client: &reqwest::Client,
+    config: &Config,
     accession: &str,
     output_dir: &Path,
     files: &[common::PrideFile],
@@ -37,7 +41,7 @@ pub async fn validate_checksums(
     let url = format!("{}/files/checksum/{accession}", common::PRIDE_API_BASE);
     info!("{accession}: fetching checksums...");
     let what = format!("fetch checksums for {accession}");
-    let body = common::retry_with_backoff(&what, || {
+    let body = common::retry_with_backoff(&what, config.max_retries, || {
         let client = client.clone();
         let url = url.clone();
         async move {
@@ -66,12 +70,12 @@ pub async fn validate_checksums(
     val_bar.set_style(common::count_style());
     val_bar.set_prefix(format!("{accession} validating"));
 
-    // Concurrency: fixed override via VALIDATE_CONCURRENCY, otherwise AIMD
-    // (adaptive limiter starting at min(cpu, 16), max cpu_count). The AIMD
-    // controller samples aggregate hash throughput and adjusts the limit.
+    // Concurrency: fixed override via config.validate_concurrency, otherwise
+    // AIMD (adaptive limiter starting at min(cpu, 16), max cpu_count). The
+    // AIMD controller samples aggregate hash throughput and adjusts the limit.
     let bytes_hashed = Arc::new(AtomicU64::new(0));
     let (limiter, fixed_limit): (Arc<common::AdaptiveLimiter>, Option<usize>) =
-        match *common::VALIDATE_CONCURRENCY {
+        match config.validate_concurrency {
             Some(n) => (Arc::new(common::AdaptiveLimiter::new(n, n)), Some(n)),
             None => (
                 Arc::new(common::AdaptiveLimiter::new(

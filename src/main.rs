@@ -5,7 +5,7 @@
 
 use anyhow::Result;
 use clap::Parser;
-use pride_rs::cli::{Args, run};
+use pridl::cli::{Args, run};
 
 #[tokio::main]
 async fn main() -> Result<()> {

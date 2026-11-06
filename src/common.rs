@@ -1,7 +1,7 @@
 //! Shared types, constants, and helpers for repository download/validation.
 
 use std::sync::{
-    Arc, LazyLock,
+    Arc,
     atomic::{AtomicUsize, Ordering},
 };
 
@@ -17,28 +17,6 @@ pub fn cpu_count() -> usize {
         .map_or(4, std::num::NonZero::get)
         .max(1)
 }
-
-/// Reads a positive `usize` from an env var, if set and valid.
-pub fn env_usize(key: &str) -> Option<usize> {
-    std::env::var(key).ok()?.parse().ok().filter(|&n| n > 0)
-}
-
-/// Download concurrency — network/disk-bound, so allow more than CPU count.
-/// Override with `PRIDERS_DOWNLOAD_CONCURRENCY`.
-pub static DOWNLOAD_CONCURRENCY: LazyLock<usize> = LazyLock::new(|| {
-    env_usize("PRIDE_RS_DOWNLOAD_CONCURRENCY").unwrap_or_else(|| (cpu_count() * 2).min(8))
-});
-
-/// Validation concurrency — MD5 is CPU-bound, one per core.
-/// Override with `PRIDERS_VALIDATE_CONCURRENCY` (disables AIMD, uses fixed value).
-pub static VALIDATE_CONCURRENCY: LazyLock<Option<usize>> =
-    LazyLock::new(|| env_usize("PRIDERS_VALIDATE_CONCURRENCY"));
-
-/// Maximum number of attempts for retryable operations.
-// Override with `PRIDERS_MAX_RETRIES`.
-pub static MAX_RETRIES: LazyLock<usize> = LazyLock::new(|| {
-    env_usize("PRIDE_RS_MAX_RETRIES").unwrap_or_else(|| 5)
-});
 
 /// Base URL of the PRIDE archive v3 API.
 pub const PRIDE_API_BASE: &str = "https://www.ebi.ac.uk/pride/ws/archive/v3";
@@ -94,28 +72,35 @@ impl PrideFile {
 
 /// Retries an idempotent operation with exponential backoff. Used for both
 /// file downloads (resume via `.part`) and small API GETs (no resume needed).
+/// The attempt count comes from [`Config::max_retries`](crate::config::Config::max_retries).
 ///
 /// # Errors
 ///
-/// Returns the last error, with context, once all [`MAX_RETRIES`] attempts
+/// Returns the last error, with context, once all `max_retries` attempts
 /// have failed.
-pub async fn retry_with_backoff<T, F, Fut>(what: &str, op: F) -> Result<T>
+pub async fn retry_with_backoff<T, F, Fut>(what: &str, max_retries: usize, op: F) -> Result<T>
 where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = Result<T>>,
 {
-    for attempt in 1..=*MAX_RETRIES {
+    for attempt in 1..=max_retries {
         match op().await {
             Ok(v) => return Ok(v),
-            Err(e) if attempt < *MAX_RETRIES => {
-                let backoff = std::time::Duration::from_secs(2u64.pow((attempt - 1).try_into().expect("MAX_ENTRIES should be no larger than u32 allows")));
+            Err(e) if attempt < max_retries => {
+                let backoff = std::time::Duration::from_secs(
+                    2u64.pow(
+                        (attempt - 1)
+                            .try_into()
+                            .expect("max_retries should be no larger than u32 allows"),
+                    ),
+                );
                 warn!(
-                    "{what}: attempt {attempt}/{} failed: {e:#}. Retrying in {backoff:?}", *MAX_RETRIES
+                    "{what}: attempt {attempt}/{max_retries} failed: {e:#}. Retrying in {backoff:?}"
                 );
                 tokio::time::sleep(backoff).await;
             }
             Err(e) => {
-                return Err(e).context(format!("{what}: all {} attempts failed", *MAX_RETRIES));
+                return Err(e).context(format!("{what}: all {max_retries} attempts failed"));
             }
         }
     }

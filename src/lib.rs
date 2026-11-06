@@ -1,3 +1,5 @@
+#![doc = include_str!("../README.md")]
+
 //! `pride-rs` — download datasets and files from the
 //! [PRIDE](https://www.ebi.ac.uk/pride) proteomics archive.
 //!
@@ -12,10 +14,12 @@
 
 pub mod cli;
 pub mod common;
+pub mod config;
 pub mod pride;
 pub mod repository;
 pub mod validate;
 
+pub use config::{CliOverrides, Config};
 pub use pride::Pride;
 pub use repository::Repository;
 pub use validate::validate_checksums;
