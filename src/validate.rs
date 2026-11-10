@@ -1,4 +1,10 @@
 //! MD5 checksum validation of downloaded files against the PRIDE checksum TSV.
+//!
+//! MD5 is CPU-bound, so files are hashed in parallel, capped by the shared
+//! [`common::ConcurrencyLimits`] (fixed at [`Config::validate_concurrency`],
+//! or adaptive via AIMD when unset). [`validate_file`] validates a single
+//! file — used to validate each file inline as soon as its download completes
+//! — while [`validate_checksums`] validates a whole dataset in one call.
 
 use std::{
     collections::HashMap,
@@ -10,7 +16,7 @@ use std::{
     },
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use indicatif::{MultiProgress, ProgressBar};
 use log::{info, warn};
 use md5::{Digest, Md5};
@@ -18,27 +24,18 @@ use md5::{Digest, Md5};
 use super::common;
 use super::config::Config;
 
-/// Downloads the PRIDE checksum TSV and validates MD5 of each downloaded file
-/// in parallel, since MD5 is CPU-bound. Concurrency is capped by the shared
-/// `limits` (fixed at [`Config::validate_concurrency`], or adaptively when
-/// unset), so the cap stays global when several datasets validate at once.
-/// Files with a mismatching checksum are deleted so the next run re-downloads
-/// them.
+/// Fetches and parses the PRIDE checksum TSV (`File-Name\tFile-MD5Checksum\tFile-Size`)
+/// for `accession` into a map of file name to expected MD5 hex digest.
 ///
 /// # Errors
 ///
-/// Returns an error if the checksum TSV cannot be fetched after
-/// `config.max_retries` attempts, or if any file's checksum mismatches or
-/// cannot be computed.
-pub async fn validate_checksums(
+/// Returns an error if the TSV cannot be fetched after `config.max_retries`
+/// attempts or the response cannot be read.
+pub async fn fetch_checksums(
     client: &reqwest::Client,
     config: &Config,
-    limits: &Arc<common::ConcurrencyLimits>,
     accession: &str,
-    output_dir: &Path,
-    files: &[common::PrideFile],
-    multi: &MultiProgress,
-) -> Result<()> {
+) -> Result<HashMap<String, String>> {
     let url = format!("{}/files/checksum/{accession}", common::PRIDE_API_BASE);
     info!("{accession}: fetching checksums...");
     let what = format!("fetch checksums for {accession}");
@@ -63,6 +60,94 @@ pub async fn validate_checksums(
     let checksums = parse_checksum_tsv(&body);
     if checksums.is_empty() {
         warn!("{accession}: checksum file was empty, skipping validation");
+    }
+    Ok(checksums)
+}
+
+/// Validates one downloaded file: hashes `output_dir/file_name` with MD5 in a
+/// blocking task (async-spawn-blocking), gated by the shared validation
+/// limiter, and compares against `expected` (case-insensitive). On mismatch
+/// the file is deleted so the next run re-downloads it instead of skipping
+/// it via the exists() check.
+///
+/// Call [`common::ConcurrencyLimits::start_aimd`] once before validating a
+/// batch so the adaptive limiter's controller is running.
+///
+/// # Errors
+///
+/// Returns an error if the MD5 cannot be computed or the checksum mismatches.
+pub async fn validate_file(
+    limits: &Arc<common::ConcurrencyLimits>,
+    accession: &str,
+    output_dir: &Path,
+    file_name: &str,
+    expected: &str,
+    file_size: u64,
+    multi: &MultiProgress,
+) -> Result<()> {
+    let path = output_dir.join(file_name);
+
+    // Per-file byte bar for MD5 reading progress.
+    let md5_pb = multi.add(ProgressBar::new(file_size));
+    md5_pb.set_style(common::bytes_style());
+    md5_pb.set_prefix(format!("MD5 {file_name}"));
+
+    let guard = limits.validations.acquire().await;
+    let md5_result = {
+        let path = path.clone();
+        let pb = md5_pb.clone();
+        let counter = limits.bytes_hashed.clone();
+        match tokio::task::spawn_blocking(move || compute_md5(&path, &pb, &counter)).await {
+            Ok(r) => r,
+            Err(e) => Err(e).context("md5 task panicked"),
+        }
+    };
+    drop(guard);
+    md5_pb.finish_and_clear();
+
+    let actual = match md5_result {
+        Ok(actual) => actual,
+        Err(e) => {
+            warn!("{accession}/{file_name}: failed to compute MD5: {e:#}");
+            return Err(e).context(format!("{accession}/{file_name}: failed to compute MD5"));
+        }
+    };
+
+    if actual.eq_ignore_ascii_case(expected) {
+        info!("{accession}/{file_name}: checksum OK");
+        return Ok(());
+    }
+
+    warn!("{accession}/{file_name}: checksum mismatch (expected {expected}, got {actual})");
+    match tokio::fs::remove_file(&path).await {
+        Ok(()) => {
+            info!("{accession}/{file_name}: removed corrupt file, will re-download on next run")
+        }
+        Err(e) => warn!("{accession}/{file_name}: failed to remove corrupt file: {e}"),
+    }
+    bail!("{accession}/{file_name}: checksum mismatch (expected {expected}, got {actual})")
+}
+
+/// Fetches the PRIDE checksum TSV and validates MD5 of every file in `files`
+/// in parallel (see [`validate_file`]), capped by the shared `limits` so the
+/// cap stays global when several datasets validate at once.
+///
+/// # Errors
+///
+/// Returns an error if the checksum TSV cannot be fetched after
+/// `config.max_retries` attempts, or if any file's checksum mismatches or
+/// cannot be computed.
+pub async fn validate_checksums(
+    client: &reqwest::Client,
+    config: &Config,
+    limits: &Arc<common::ConcurrencyLimits>,
+    accession: &str,
+    output_dir: &Path,
+    files: &[common::PrideFile],
+    multi: &MultiProgress,
+) -> Result<()> {
+    let checksums = fetch_checksums(client, config, accession).await?;
+    if checksums.is_empty() {
         return Ok(());
     }
 
@@ -70,19 +155,12 @@ pub async fn validate_checksums(
     let val_bar = multi.add(ProgressBar::new(files.len() as u64));
     val_bar.set_style(common::count_style());
     val_bar.set_prefix(format!("{accession} validating"));
-
-    // Concurrency: the limiter is shared across all datasets of the run (fixed
-    // at config.validate_concurrency, or adaptive otherwise). The AIMD
-    // controller samples aggregate hash throughput and adjusts the shared
-    // limit; it is spawned once and lives until `limits` is dropped.
-    let limiter = limits.validations.clone();
-    let bytes_hashed = limits.bytes_hashed.clone();
     limits.start_aimd();
 
-    // Spawn one task per file, gated by the adaptive limiter. Each task
-    // offloads the CPU-bound MD5 to spawn_blocking (async-spawn-blocking).
+    // Spawn one task per file; each task acquires a slot of the shared
+    // limiter inside validate_file and offloads the CPU-bound MD5 to
+    // spawn_blocking.
     let mut set = tokio::task::JoinSet::new();
-
     for file in files {
         let file_name = file.file_name.clone();
         let Some(expected) = checksums.get(&file_name).cloned() else {
@@ -95,53 +173,34 @@ pub async fn validate_checksums(
             .file_size
             .unwrap_or_else(|| std::fs::metadata(&path).map_or(0, |m| m.len()));
 
-        // Per-file byte bar for MD5 reading progress.
-        let md5_pb = multi.add(ProgressBar::new(file_size));
-        md5_pb.set_style(common::bytes_style());
-        md5_pb.set_prefix(format!("MD5 {file_name}"));
-
-        let guard = limiter.acquire().await;
+        let limits = limits.clone();
+        let output_dir = output_dir.to_path_buf();
+        let multi = multi.clone();
         let val_bar = val_bar.clone();
-        let bytes_hashed = bytes_hashed.clone();
+        let accession = accession.to_string();
         set.spawn(async move {
-            let _guard = guard;
-            let md5_result = {
-                let path = path.clone();
-                let pb = md5_pb.clone();
-                let counter = bytes_hashed.clone();
-                match tokio::task::spawn_blocking(move || compute_md5(&path, &pb, &counter)).await {
-                    Ok(r) => r,
-                    Err(e) => Err(e).context("md5 task panicked"),
-                }
-            };
-            md5_pb.finish_and_clear();
+            let result = validate_file(
+                &limits,
+                &accession,
+                &output_dir,
+                &file_name,
+                &expected,
+                file_size,
+                &multi,
+            )
+            .await;
             val_bar.inc(1);
-            (file_name, expected, md5_result)
+            (file_name, result)
         });
     }
 
     // Collect results as tasks complete (completion order, not spawn order).
+    // validate_file already logged the per-file specifics.
     let mut failures = Vec::new();
     while let Some(task_result) = set.join_next().await {
         match task_result {
-            Ok((file_name, expected, Ok(actual))) if actual.eq_ignore_ascii_case(&expected) => {
-                info!("{file_name}: checksum OK");
-            }
-            Ok((file_name, expected, Ok(actual))) => {
-                warn!("{file_name}: checksum mismatch (expected {expected}, got {actual})");
-                // Delete the corrupt file so the next run re-downloads it
-                // instead of skipping it via the exists() check.
-                let corrupt_path = output_dir.join(&file_name);
-                match tokio::fs::remove_file(&corrupt_path).await {
-                    Ok(()) => {
-                        info!("{file_name}: removed corrupt file, will re-download on next run");
-                    }
-                    Err(e) => warn!("{file_name}: failed to remove corrupt file: {e}"),
-                }
-                failures.push(file_name);
-            }
-            Ok((file_name, _, Err(e))) => {
-                warn!("{file_name}: failed to compute MD5: {e}");
+            Ok((_file_name, Ok(()))) => {}
+            Ok((file_name, Err(_))) => {
                 failures.push(file_name);
             }
             Err(e) => {
@@ -153,7 +212,7 @@ pub async fn validate_checksums(
     val_bar.finish_and_clear();
 
     if !failures.is_empty() {
-        anyhow::bail!(
+        bail!(
             "checksum validation failed for {} file(s): {}",
             failures.len(),
             failures.join(", ")
@@ -236,5 +295,82 @@ mod tests {
     #[test]
     fn parse_checksum_tsv_empty_body() {
         assert!(parse_checksum_tsv("").is_empty());
+    }
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("pxdprowl-validate-test-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    // md5("hello")
+    const MD5_HELLO: &str = "5d41402abc4b2a76b9719d911017c592";
+
+    #[tokio::test]
+    async fn validate_file_accepts_matching_checksum() {
+        let dir = temp_dir("ok");
+        std::fs::write(dir.join("a.raw"), b"hello").unwrap();
+        let limits = Arc::new(common::ConcurrencyLimits::new(&Config::default()));
+        let multi = MultiProgress::new();
+        validate_file(&limits, "PXD000001", &dir, "a.raw", MD5_HELLO, 5, &multi)
+            .await
+            .unwrap();
+        assert!(dir.join("a.raw").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn validate_file_accepts_uppercase_checksum() {
+        let dir = temp_dir("upper");
+        std::fs::write(dir.join("a.raw"), b"hello").unwrap();
+        let limits = Arc::new(common::ConcurrencyLimits::new(&Config::default()));
+        let multi = MultiProgress::new();
+        validate_file(
+            &limits,
+            "PXD000001",
+            &dir,
+            "a.raw",
+            &MD5_HELLO.to_uppercase(),
+            5,
+            &multi,
+        )
+        .await
+        .unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn validate_file_deletes_file_and_errors_on_mismatch() {
+        let dir = temp_dir("mismatch");
+        std::fs::write(dir.join("a.raw"), b"hello").unwrap();
+        let limits = Arc::new(common::ConcurrencyLimits::new(&Config::default()));
+        let multi = MultiProgress::new();
+        let err = validate_file(
+            &limits,
+            "PXD000001",
+            &dir,
+            "a.raw",
+            &"0".repeat(32),
+            5,
+            &multi,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("checksum mismatch"));
+        assert!(!dir.join("a.raw").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn validate_file_errors_on_missing_file() {
+        let dir = temp_dir("missing");
+        let limits = Arc::new(common::ConcurrencyLimits::new(&Config::default()));
+        let multi = MultiProgress::new();
+        let err = validate_file(&limits, "PXD000001", &dir, "gone.raw", MD5_HELLO, 5, &multi)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("failed to compute MD5"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

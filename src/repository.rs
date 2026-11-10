@@ -44,7 +44,9 @@ pub trait Repository {
 
     /// Downloads all files of the dataset `accession` into
     /// `dest/{accession}/` and validates their checksums. Returns the
-    /// number of files in the dataset.
+    /// number of files in the dataset. Each file is checksum-validated as
+    /// soon as its own download completes, so MD5 hashing overlaps the
+    /// remaining downloads instead of running as a separate phase.
     ///
     /// `limits` holds the batch-wide concurrency caps shared with every other
     /// dataset of the run, so `download_concurrency` and

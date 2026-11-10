@@ -23,4 +23,4 @@ pub use common::ConcurrencyLimits;
 pub use config::{CliOverrides, Config, DownloadRequest, ResolvedConfig};
 pub use pride::Pride;
 pub use repository::Repository;
-pub use validate::validate_checksums;
+pub use validate::{fetch_checksums, validate_checksums, validate_file};

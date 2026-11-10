@@ -54,8 +54,13 @@ urls = ["https://ftp.pride.ebi.ac.uk/pride/data/archive/2024/01/PXD000003/extra.
 
 ## Running from the config file
 With no subcommand, `pxdprowl` runs the downloads listed in the config file
-(datasets first, then `files`, then `urls`), continuing past individual
-failures and summarizing them at the end:
+(datasets first, then `files`, then `urls`) **concurrently**, so a small
+dataset doesn't delay the others — `download-concurrency` and
+`validate-concurrency` are global caps shared by all of them. Each file's
+MD5 checksum is validated as soon as its own download completes, so
+validation overlaps the remaining downloads instead of adding a separate
+phase at the end. Individual failures don't stop the batch; they are
+summarized at the end:
 
 ```console
 $ pxdprowl        # downloads everything listed in ./pxdprowl.toml

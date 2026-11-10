@@ -1,9 +1,10 @@
 //! [PRIDE](https://www.ebi.ac.uk/pride) archive implementation of [`Repository`].
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use indicatif::{MultiProgress, ProgressBar};
 use log::{info, warn};
 use tokio::io::AsyncWriteExt;
@@ -11,7 +12,7 @@ use tokio::io::AsyncWriteExt;
 use super::common;
 use super::config::Config;
 use super::repository::Repository;
-use super::validate_checksums;
+use super::validate::{fetch_checksums, validate_file};
 
 /// The [PRIDE](https://www.ebi.ac.uk/pride) proteomics repository at EBI.
 pub struct Pride;
@@ -100,6 +101,25 @@ impl Repository for Pride {
         dl_bar.set_style(common::count_style());
         dl_bar.set_prefix(format!("{accession} download"));
 
+        // Fetch the checksum TSV concurrently with the downloads: each file
+        // is validated inline as soon as its own download completes, so the
+        // CPU-bound MD5 hashing overlaps the remaining (network-bound)
+        // downloads instead of running as a separate phase afterwards.
+        let checksums: Arc<tokio::sync::OnceCell<Result<HashMap<String, String>>>> =
+            Arc::new(tokio::sync::OnceCell::new());
+        let checksums_fetch = tokio::spawn({
+            let client = client.clone();
+            let config = config.clone();
+            let accession = accession.to_string();
+            let checksums = checksums.clone();
+            async move {
+                checksums
+                    .get_or_init(|| fetch_checksums(&client, &config, &accession))
+                    .await;
+            }
+        });
+        limits.start_aimd();
+
         // Download missing files with limited concurrency. The semaphore is
         // shared across all datasets of the run, so `download_concurrency`
         // stays a global cap. JoinSet processes results as they complete
@@ -115,56 +135,146 @@ impl Repository for Pride {
                 .context("semaphore closed unexpectedly")?;
             let client = client.clone();
             let config = config.clone();
+            let limits = limits.clone();
             let file_name = file.file_name.clone();
+            let file_size = file.file_size.unwrap_or(0);
             let url = file.https_url();
             let dest = output_dir.join(&file_name);
             let multi = multi.clone();
             let dl_bar = dl_bar.clone();
+            let checksums = checksums.clone();
+            let output_dir = output_dir.clone();
+            let accession = accession.to_string();
             set.spawn(async move {
-                let _permit = permit;
-                let result = Self::download_file(&client, &config, &url, &dest, &multi).await;
+                // Hold the download permit only for the download itself:
+                // inline validation must not occupy a download slot.
+                let result = {
+                    let _permit = permit;
+                    Self::download_file(&client, &config, &url, &dest, &multi).await
+                };
                 dl_bar.inc(1);
-                (file_name, result)
+                // Validate inline, overlapping the remaining downloads.
+                let validation = match &result {
+                    Ok(()) => {
+                        InlineValidation {
+                            checksums: &checksums,
+                            client: &client,
+                            config: &config,
+                            limits: &limits,
+                            accession: &accession,
+                            output_dir: &output_dir,
+                            multi: &multi,
+                        }
+                        .validate(&file_name, file_size)
+                        .await
+                    }
+                    Err(_) => Ok(()),
+                };
+                (file_name, result, validation)
             });
         }
 
-        let mut failed = Vec::new();
+        let mut failed_downloads = Vec::new();
+        let mut failed_checksums = Vec::new();
         while let Some(task_result) = set.join_next().await {
             match task_result {
-                Ok((_file_name, Ok(()))) => {}
-                Ok((file_name, Err(e))) => {
-                    warn!("{accession}/{file_name}: download failed: {e:#}");
-                    failed.push(file_name);
+                Ok((file_name, download, validation)) => {
+                    if let Err(e) = download {
+                        warn!("{accession}/{file_name}: download failed: {e:#}");
+                        failed_downloads.push(file_name.clone());
+                    }
+                    // validate_file already logged the per-file specifics.
+                    if validation.is_err() {
+                        failed_checksums.push(file_name);
+                    }
                 }
                 Err(e) => {
                     warn!("{accession}: task panicked: {e}");
-                    failed.push("unknown".to_string());
+                    failed_downloads.push("unknown".to_string());
                 }
             }
         }
         dl_bar.finish_and_clear();
 
-        if !failed.is_empty() {
-            anyhow::bail!(
-                "{} file(s) failed to download: {}",
-                failed.len(),
-                failed.join(", ")
-            );
+        // Surface a failed checksum-TSV fetch only now (after the downloads),
+        // matching the previous validate-after-download ordering.
+        checksums_fetch
+            .await
+            .context("checksum fetch task panicked")?;
+        if let Some(Err(e)) = checksums.get() {
+            bail!("failed to fetch checksums for {accession}: {e:#}");
         }
 
-        // Validate checksums (sharing the batch-wide validation limiter).
-        validate_checksums(
-            client,
-            config,
-            limits,
-            accession,
-            &output_dir,
-            &files,
-            multi,
-        )
-        .await?;
+        if !failed_downloads.is_empty() {
+            bail!(
+                "{} file(s) failed to download: {}",
+                failed_downloads.len(),
+                failed_downloads.join(", ")
+            );
+        }
+        if !failed_checksums.is_empty() {
+            bail!(
+                "checksum validation failed for {} file(s): {}",
+                failed_checksums.len(),
+                failed_checksums.join(", ")
+            );
+        }
+        info!("{accession}: all checksums validated");
 
         Ok(files.len())
+    }
+}
+
+/// Shared context for validating one downloaded file inline: cheap references
+/// to the per-dataset state that every file task already holds.
+struct InlineValidation<'a> {
+    checksums: &'a Arc<tokio::sync::OnceCell<Result<HashMap<String, String>>>>,
+    client: &'a reqwest::Client,
+    config: &'a Config,
+    limits: &'a Arc<common::ConcurrencyLimits>,
+    accession: &'a str,
+    output_dir: &'a Path,
+    multi: &'a MultiProgress,
+}
+
+impl InlineValidation<'_> {
+    /// Looks up the file's expected MD5 in the shared checksum map (fetched
+    /// concurrently with the downloads) and validates the downloaded file.
+    /// A missing checksum entry or a failed TSV fetch skips validation here;
+    /// the fetch error is surfaced by the caller after the download phase.
+    async fn validate(&self, file_name: &str, file_size: u64) -> Result<()> {
+        let map = self
+            .checksums
+            .get_or_init(|| fetch_checksums(self.client, self.config, self.accession))
+            .await;
+        let Ok(map) = map else {
+            return Ok(());
+        };
+        if map.is_empty() {
+            return Ok(());
+        }
+        let Some(expected) = map.get(file_name) else {
+            warn!(
+                "{}/{file_name}: no checksum found, skipping",
+                self.accession
+            );
+            return Ok(());
+        };
+        let size = if file_size > 0 {
+            file_size
+        } else {
+            std::fs::metadata(self.output_dir.join(file_name)).map_or(0, |m| m.len())
+        };
+        validate_file(
+            self.limits,
+            self.accession,
+            self.output_dir,
+            file_name,
+            expected,
+            size,
+            self.multi,
+        )
+        .await
     }
 }
 
@@ -268,4 +378,123 @@ async fn try_download_once(
 
     info!("Downloaded {file_name} ({grand_total} bytes)");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // md5("hello")
+    const MD5_HELLO: &str = "5d41402abc4b2a76b9719d911017c592";
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("pxdprowl-inline-test-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Builds an InlineValidation whose checksum cell is pre-set, so no
+    /// network fetch happens.
+    fn validator<'a>(
+        checksums: &'a Arc<tokio::sync::OnceCell<Result<HashMap<String, String>>>>,
+        client: &'a reqwest::Client,
+        config: &'a Config,
+        limits: &'a Arc<common::ConcurrencyLimits>,
+        output_dir: &'a Path,
+        multi: &'a MultiProgress,
+    ) -> InlineValidation<'a> {
+        InlineValidation {
+            checksums,
+            client,
+            config,
+            limits,
+            accession: "PXD000001",
+            output_dir,
+            multi,
+        }
+    }
+
+    fn checksum_cell(
+        entries: &[(&str, &str)],
+    ) -> Arc<tokio::sync::OnceCell<Result<HashMap<String, String>>>> {
+        let cell = Arc::new(tokio::sync::OnceCell::new());
+        cell.set(Ok(entries
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()))
+            .unwrap();
+        cell
+    }
+
+    #[tokio::test]
+    async fn inline_validation_ok_on_matching_checksum() {
+        let dir = temp_dir("ok");
+        std::fs::write(dir.join("a.raw"), b"hello").unwrap();
+        let config = Config::default();
+        let client = reqwest::Client::new();
+        let limits = Arc::new(common::ConcurrencyLimits::new(&config));
+        let multi = MultiProgress::new();
+        let checksums = checksum_cell(&[("a.raw", MD5_HELLO)]);
+        validator(&checksums, &client, &config, &limits, &dir, &multi)
+            .validate("a.raw", 5)
+            .await
+            .unwrap();
+        assert!(dir.join("a.raw").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn inline_validation_mismatch_errors_and_deletes_file() {
+        let dir = temp_dir("mismatch");
+        std::fs::write(dir.join("a.raw"), b"hello").unwrap();
+        let config = Config::default();
+        let client = reqwest::Client::new();
+        let limits = Arc::new(common::ConcurrencyLimits::new(&config));
+        let multi = MultiProgress::new();
+        let checksums = checksum_cell(&[("a.raw", &"0".repeat(32))]);
+        let err = validator(&checksums, &client, &config, &limits, &dir, &multi)
+            .validate("a.raw", 5)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("checksum mismatch"));
+        assert!(!dir.join("a.raw").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn inline_validation_skips_file_missing_from_checksum_map() {
+        let dir = temp_dir("unknown");
+        std::fs::write(dir.join("a.raw"), b"hello").unwrap();
+        let config = Config::default();
+        let client = reqwest::Client::new();
+        let limits = Arc::new(common::ConcurrencyLimits::new(&config));
+        let multi = MultiProgress::new();
+        let checksums = checksum_cell(&[("other.raw", MD5_HELLO)]);
+        validator(&checksums, &client, &config, &limits, &dir, &multi)
+            .validate("a.raw", 5)
+            .await
+            .unwrap();
+        assert!(dir.join("a.raw").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn inline_validation_skips_when_checksum_fetch_failed() {
+        let dir = temp_dir("fetch-failed");
+        std::fs::write(dir.join("a.raw"), b"hello").unwrap();
+        let config = Config::default();
+        let client = reqwest::Client::new();
+        let limits = Arc::new(common::ConcurrencyLimits::new(&config));
+        let multi = MultiProgress::new();
+        let checksums = Arc::new(tokio::sync::OnceCell::new());
+        checksums.set(Err(anyhow::anyhow!("boom"))).unwrap();
+        // The fetch error is surfaced by the caller, not here: validation skips.
+        validator(&checksums, &client, &config, &limits, &dir, &multi)
+            .validate("a.raw", 5)
+            .await
+            .unwrap();
+        assert!(dir.join("a.raw").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
