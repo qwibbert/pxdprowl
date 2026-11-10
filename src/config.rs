@@ -1,7 +1,7 @@
-//! Runtime configuration for `pride-rs`.
+//! Runtime configuration for `pxdprowl`.
 //!
 //! The binary reads an optional TOML config file: the path given with
-//! `--config`, or `./pridl.toml` in the current directory when present.
+//! `--config`, or `./pxdprowl.toml` in the current directory when present.
 //! Paths inside the config file (like `output`) are resolved relative to the
 //! config file's directory, so a project config can be checked into version
 //! control next to the data for reproducibility.
@@ -20,19 +20,19 @@ use serde::Deserialize;
 use crate::common::cpu_count;
 
 /// Name of the default config file looked up in the current directory.
-pub const CONFIG_FILE_NAME: &str = "pridl.toml";
+pub const CONFIG_FILE_NAME: &str = "pxdprowl.toml";
 
 /// Output directory used when nothing else specifies one.
 pub const DEFAULT_OUTPUT: &str = "datasets";
 
 /// Env var overriding [`Config::output`].
-pub const ENV_OUTPUT: &str = "PRIDL_OUTPUT";
+pub const ENV_OUTPUT: &str = "PXDPROWL_OUTPUT";
 /// Env var overriding [`Config::download_concurrency`].
-pub const ENV_DOWNLOAD_CONCURRENCY: &str = "PRIDL_DOWNLOAD_CONCURRENCY";
+pub const ENV_DOWNLOAD_CONCURRENCY: &str = "PXDPROWL_DOWNLOAD_CONCURRENCY";
 /// Env var overriding [`Config::validate_concurrency`].
-pub const ENV_VALIDATE_CONCURRENCY: &str = "PRIDL_VALIDATE_CONCURRENCY";
+pub const ENV_VALIDATE_CONCURRENCY: &str = "PXDPROWL_VALIDATE_CONCURRENCY";
 /// Env var overriding [`Config::max_retries`].
-pub const ENV_MAX_RETRIES: &str = "PRIDL_MAX_RETRIES";
+pub const ENV_MAX_RETRIES: &str = "PXDPROWL_MAX_RETRIES";
 
 /// Resolved runtime settings, passed explicitly through the library.
 ///
@@ -132,7 +132,7 @@ struct FileOverrides {
     urls: Vec<String>,
 }
 
-/// The on-disk config file format (`pridl.toml`).
+/// The on-disk config file format (`pxdprowl.toml`).
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 struct ConfigFile {
@@ -188,7 +188,7 @@ impl FileOverrides {
 }
 
 impl EnvOverrides {
-    /// Reads the `PRIDL_*` env vars. Unset vars are `None`; set-but-invalid
+    /// Reads the `PXDPROWL_*` env vars. Unset vars are `None`; set-but-invalid
     /// values are an error so typos don't silently fall back to defaults.
     fn from_env() -> Result<Self> {
         Ok(Self {
@@ -214,8 +214,8 @@ impl Default for Config {
 
 impl Config {
     /// Resolves the effective configuration and download plan: CLI overrides
-    /// win over the `PRIDL_*` env vars, which win over the config file
-    /// (`--config PATH`, else `./pridl.toml` when present), which wins over
+    /// win over the `PXDPROWL_*` env vars, which win over the config file
+    /// (`--config PATH`, else `./pxdprowl.toml` when present), which wins over
     /// the built-in defaults.
     ///
     /// # Errors
@@ -360,7 +360,7 @@ mod tests {
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir =
-            std::env::temp_dir().join(format!("pridl-config-test-{tag}-{}", std::process::id()));
+            std::env::temp_dir().join(format!("pxdprowl-config-test-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -544,7 +544,7 @@ mod tests {
         let err = Config::resolve_from(
             Path::new(""),
             &CliOverrides {
-                config: Some(PathBuf::from("/nonexistent/pridl.toml")),
+                config: Some(PathBuf::from("/nonexistent/pxdprowl.toml")),
                 ..Default::default()
             },
         )

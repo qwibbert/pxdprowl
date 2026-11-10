@@ -1,11 +1,11 @@
-//! Binary entry point for `pride-rs`.
+//! Binary entry point for `pxdprowl`.
 //!
-//! All logic lives in the library crate ([`pride_rs`]); this file only parses
-//! CLI arguments and dispatches to [`pride_rs::cli::run`].
+//! All logic lives in the library crate ([`pxdprowl`]); this file only parses
+//! CLI arguments and dispatches to [`pxdprowl::cli::run`].
 
 use anyhow::Result;
 use clap::Parser;
-use pridl::cli::{Args, run};
+use pxdprowl::cli::{Args, run};
 
 #[tokio::main]
 async fn main() -> Result<()> {

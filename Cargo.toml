@@ -1,12 +1,12 @@
 [package]
-name = "pridl"
+name = "pxdprowl"
 version = "0.1.0"
 edition = "2024"
 description = "Download datasets and files from the PRIDE proteomics archive"
-repository = "https://github.com/qwibbert/pridl"
+repository = "https://github.com/qwibbert/pxdprowl"
 license = "MIT"
 readme = "README.md"
-documentation = "https://docs.rs/pridl"
+documentation = "https://docs.rs/pxdprowl"
 keywords = ["proteomics", "mass-spectrometry", "pride", "download", "pride-archive"]
 
 [lints.clippy]

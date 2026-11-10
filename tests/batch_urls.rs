@@ -4,14 +4,14 @@
 //! Two `urls` entries point at a local responder that delays every response
 //! by 2s. If the batch ran sequentially the run would take >= 4s; running
 //! concurrently it takes ~2s. (Only one test per binary may call
-//! `pridl::cli::run`, because it installs the global logger.)
+//! `pxdprowl::cli::run`, because it installs the global logger.)
 
 use std::io::Write as _;
 use std::net::TcpListener;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use pridl::cli::{Args, run};
+use pxdprowl::cli::{Args, run};
 
 /// Binds a local responder that delays each response by `delay` and answers
 /// with a 1 KiB body. Returns the port and the accept-loop thread handle.
@@ -42,9 +42,9 @@ async fn batch_urls_run_concurrently() {
     let delay = Duration::from_secs(2);
     let (port, server) = spawn_slow_responder(delay);
 
-    let dir = std::env::temp_dir().join(format!("pridl-batch-test-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("pxdprowl-batch-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let config_path = dir.join("pridl.toml");
+    let config_path = dir.join("pxdprowl.toml");
     std::fs::write(
         &config_path,
         format!(
@@ -53,7 +53,7 @@ async fn batch_urls_run_concurrently() {
     )
     .unwrap();
 
-    let args = Args::try_parse_from(["pridl", "-c", config_path.to_str().unwrap()]).unwrap();
+    let args = Args::try_parse_from(["pxdprowl", "-c", config_path.to_str().unwrap()]).unwrap();
     let start = Instant::now();
     run(args).await.unwrap();
     let elapsed = start.elapsed();

@@ -1,6 +1,6 @@
 #![doc = include_str!("../README.md")]
 
-//! `pride-rs` — download datasets and files from the
+//! `pxdprowl` — download datasets and files from the
 //! [PRIDE](https://www.ebi.ac.uk/pride) proteomics archive.
 //!
 //! The crate is split into a library (this module tree) and a thin binary

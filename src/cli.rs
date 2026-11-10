@@ -1,4 +1,4 @@
-//! Command-line interface for `pride-rs`.
+//! Command-line interface for `pxdprowl`.
 //!
 //! Defines the clap argument structure and the [`run`] dispatcher that
 //! executes each subcommand against the PRIDE archive.
@@ -24,13 +24,13 @@ use crate::{Pride, Repository};
 ///
 /// With no subcommand, the downloads listed in the config file are run.
 #[derive(Parser, Debug)]
-#[command(name = "pride-rs", version, about, long_about = None)]
+#[command(name = "pxdprowl", version, about, long_about = None)]
 pub struct Args {
-    /// Path to the config file. Defaults to ./pridl.toml when present.
+    /// Path to the config file. Defaults to ./pxdprowl.toml when present.
     #[arg(short, long, global = true, value_name = "PATH")]
     pub config: Option<PathBuf>,
 
-    /// Directory to store downloaded files. Overrides PRIDL_OUTPUT and the
+    /// Directory to store downloaded files. Overrides PXDPROWL_OUTPUT and the
     /// `output` key in the config file. Defaults to `datasets`.
     #[arg(short, long, global = true, value_name = "DIR")]
     pub output: Option<PathBuf>,
@@ -40,17 +40,17 @@ pub struct Args {
     pub verbose: u8,
 
     /// Maximum number of files downloaded in parallel.
-    /// Overrides PRIDL_DOWNLOAD_CONCURRENCY and pridl.toml.
+    /// Overrides PXDPROWL_DOWNLOAD_CONCURRENCY and pxdprowl.toml.
     #[arg(long, global = true, value_name = "N")]
     pub download_concurrency: Option<usize>,
 
     /// Fixed number of parallel checksum validations (disables the adaptive
-    /// limiter). Overrides PRIDL_VALIDATE_CONCURRENCY and pridl.toml.
+    /// limiter). Overrides PXDPROWL_VALIDATE_CONCURRENCY and pxdprowl.toml.
     #[arg(long, global = true, value_name = "N")]
     pub validate_concurrency: Option<usize>,
 
     /// Maximum number of attempts for retryable operations.
-    /// Overrides PRIDL_MAX_RETRIES and pridl.toml.
+    /// Overrides PXDPROWL_MAX_RETRIES and pxdprowl.toml.
     #[arg(long, global = true, value_name = "N")]
     pub max_retries: Option<usize>,
 
@@ -118,8 +118,8 @@ pub async fn run(args: Args) -> Result<()> {
     let multi = MultiProgress::new();
     init_logging(&multi, args.verbose)?;
 
-    // Resolve settings and download plan: CLI flags > PRIDL_* env vars >
-    // config file (--config, else ./pridl.toml) > built-in defaults.
+    // Resolve settings and download plan: CLI flags > PXDPROWL_* env vars >
+    // config file (--config, else ./pxdprowl.toml) > built-in defaults.
     let resolved = Config::resolve(&CliOverrides {
         config: args.config.clone(),
         output: args.output.clone(),
@@ -247,7 +247,7 @@ pub async fn run(args: Args) -> Result<()> {
 }
 
 /// Renders the long help plus a hint about subcommands / the config file,
-/// shown when `pridl` runs without a subcommand and with nothing to download.
+/// shown when `pxdprowl` runs without a subcommand and with nothing to download.
 fn help_with_hint(resolved: &ResolvedConfig) -> Result<String> {
     use std::fmt::Write as _;
     let mut cmd = Args::command();
@@ -269,7 +269,7 @@ fn help_with_hint(resolved: &ResolvedConfig) -> Result<String> {
             write!(
                 text,
                 "\nHint: pass a subcommand, or create a {CONFIG_FILE_NAME} with \
-                 `datasets`/`files`/`urls` and run `pridl` without arguments.\n"
+                 `datasets`/`files`/`urls` and run `pxdprowl` without arguments.\n"
             )
             .context("failed to render hint")?;
         }
@@ -523,7 +523,7 @@ mod tests {
 
     #[test]
     fn args_parse_without_subcommand() {
-        let args = Args::try_parse_from(["pridl"]).unwrap();
+        let args = Args::try_parse_from(["pxdprowl"]).unwrap();
         assert!(args.command.is_none());
         assert!(args.config.is_none());
         assert!(args.output.is_none());
@@ -532,7 +532,7 @@ mod tests {
     #[test]
     fn args_parse_config_and_output_flags() {
         let args = Args::try_parse_from([
-            "pridl",
+            "pxdprowl",
             "-c",
             "my.toml",
             "-o",
@@ -558,17 +558,17 @@ mod tests {
     fn help_hint_without_config_suggests_creating_one() {
         let text = help_with_hint(&resolved_without_config()).unwrap();
         assert!(text.contains("Usage:"));
-        assert!(text.contains("Hint: pass a subcommand, or create a pridl.toml"));
+        assert!(text.contains("Hint: pass a subcommand, or create a pxdprowl.toml"));
     }
 
     #[test]
     fn help_hint_with_config_names_the_loaded_file() {
         let resolved = ResolvedConfig {
-            config_path: Some(PathBuf::from("my/pridl.toml")),
+            config_path: Some(PathBuf::from("my/pxdprowl.toml")),
             ..resolved_without_config()
         };
         let text = help_with_hint(&resolved).unwrap();
-        assert!(text.contains("my/pridl.toml was loaded but lists no downloads"));
+        assert!(text.contains("my/pxdprowl.toml was loaded but lists no downloads"));
     }
 
     #[test]
