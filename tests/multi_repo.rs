@@ -74,6 +74,30 @@ fn spawn_mock() -> (u16, std::thread::JoinHandle<()>) {
                     // 429 for the first 3 hits: exhausts a max_retries=2 round,
                     // forcing the outer rate-limit retry round to kick in.
                     rate_limited(&flaky_hits, 3)
+                } else if path == "/dl/resume.raw" {
+                    // Supports Range for resume: serves "hello" (5 bytes),
+                    // honoring "Range: bytes=N-" with a 206.
+                    if let Some(i) = request.find("Range: bytes=") {
+                        let n: usize = request[i + 12..]
+                            .split(|c: char| !c.is_ascii_digit())
+                            .next()
+                            .unwrap()
+                            .parse()
+                            .unwrap_or(0);
+                        let body = &b"hello"[n.min(5)..];
+                        (
+                            format!(
+                                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {n}-4/5\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            ),
+                            body.to_vec(),
+                        )
+                    } else {
+                        (
+                            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n".to_string(),
+                            b"hello".to_vec(),
+                        )
+                    }
                 } else if path == "/dl/chunked.raw" {
                     // No Content-Length (chunked), like MassIVE's servlet.
                     (
@@ -363,7 +387,7 @@ async fn download_uses_listing_size_when_server_sends_no_content_length() {
 
     // Chunked response (no Content-Length), like MassIVE's servlet: the
     // listing-reported size drives the progress bar and completeness check.
-    let bars = repository::FileBars { multi: multi.clone(), overall: None };
+    let bars = repository::FileBars::new(multi.clone(), None);
     repository::download_file(
         &client,
         &config,
@@ -391,7 +415,7 @@ async fn download_waits_out_429_and_succeeds_on_retry() {
     let dest = dir.join("limited.raw");
 
     // First attempt gets 429 (Retry-After: 0), the retry succeeds.
-    let bars = repository::FileBars { multi: multi.clone(), overall: None };
+    let bars = repository::FileBars::new(multi.clone(), None);
     repository::download_file(
         &client,
         &config,
@@ -419,7 +443,7 @@ async fn download_survives_more_429s_than_max_retries_via_extra_rounds() {
     let dir = temp_dir("flaky");
     let dest = dir.join("flaky.raw");
 
-    let bars = repository::FileBars { multi: multi.clone(), overall: None };
+    let bars = repository::FileBars::new(multi.clone(), None);
     repository::download_file(
         &client,
         &config,
@@ -432,6 +456,49 @@ async fn download_survives_more_429s_than_max_retries_via_extra_rounds() {
     .unwrap();
 
     assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
+    std::fs::remove_dir_all(&dir).unwrap();
+    drop(server);
+}
+
+#[tokio::test]
+async fn resume_accounts_size_and_offset_in_overall_bar_once() {
+    let (port, server) = spawn_mock();
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    let config = test_config();
+    let multi = MultiProgress::new();
+    let dir = temp_dir("resume");
+    let dest = dir.join("resume.raw");
+    // Pre-seeded .part from an interrupted earlier run: 3 of 5 bytes present.
+    std::fs::write(dest.with_extension("part"), b"hel").unwrap();
+
+    // One-file dataset whose listing has no size (iProX-style).
+    let files = [RemoteFile {
+        name: "resume.raw".into(),
+        relative_path: "resume.raw".into(),
+        url: String::new(),
+        size: None,
+        category: None,
+    }];
+    let overall = repository::OverallBar::new(&multi, "PXD083540", &files);
+    let bars = repository::FileBars::new(multi.clone(), Some(overall.clone()));
+
+    repository::download_file(
+        &client,
+        &config,
+        &format!("{base}/dl/resume.raw"),
+        &dest,
+        &bars,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
+    // Size noted once from the 206 response's total; position = 3 resumed
+    // bytes + 2 newly downloaded.
+    assert_eq!(overall.length(), Some(5));
+    assert_eq!(overall.position(), 5);
     std::fs::remove_dir_all(&dir).unwrap();
     drop(server);
 }

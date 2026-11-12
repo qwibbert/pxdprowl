@@ -297,6 +297,16 @@ impl OverallBar {
     pub fn finish(&self) {
         self.bar.finish_and_clear();
     }
+
+    /// Current bar position (bytes accounted so far).
+    pub fn position(&self) -> u64 {
+        self.bar.position()
+    }
+
+    /// Current bar length (total bytes known so far).
+    pub fn length(&self) -> Option<u64> {
+        self.bar.length()
+    }
 }
 
 /// Progress bars threaded through a single-file download: the
@@ -309,6 +319,20 @@ pub struct FileBars {
     pub multi: MultiProgress,
     /// The dataset-wide overall bar, when downloading within a dataset run.
     pub overall: Option<OverallBar>,
+    /// Set once the file's size and resume offset have been accounted for in
+    /// the overall bar (shared across retry-closure clones of this struct).
+    file_accounted: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl FileBars {
+    /// Creates the bars for one file download.
+    pub fn new(multi: MultiProgress, overall: Option<OverallBar>) -> Self {
+        Self {
+            multi,
+            overall,
+            file_accounted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
 }
 
 /// Downloads every listed file of the dataset `target` into
@@ -402,10 +426,7 @@ pub async fn download_dataset<R: Repository>(
             tokio::fs::create_dir_all(parent).await?;
         }
         let multi = multi.clone();
-        let bars = FileBars {
-            multi: multi.clone(),
-            overall: Some(overall.clone()),
-        };
+        let bars = FileBars::new(multi.clone(), Some(overall.clone()));
         let checksums = checksums.clone();
         let output_dir = output_dir.clone();
         set.spawn(async move {
@@ -637,13 +658,21 @@ async fn try_download_once(
         0
     };
     let grand_total = total + already;
-    // Feed the overall bar the file's size once it is known from the response
-    // (repositories whose listing has no sizes, e.g. iProX). Only on the first
-    // attempt of a fresh download, so retries don't grow the total twice.
-    // Listing-known sizes were already added upfront by OverallBar::new.
-    if resume_from == 0 && grand_total > 0 && expected_size.is_none() {
+    // Account for the file in the overall bar exactly once per run: its size
+    // (when not already known from the listing, e.g. iProX — discovered from
+    // Content-Length here) and any resume offset. Retries and restarts must
+    // not grow the total or the position twice.
+    if grand_total > 0 {
         if let Some(overall) = &bars.overall {
-            overall.note_file_size(grand_total);
+            use std::sync::atomic::Ordering;
+            if !bars.file_accounted.swap(true, Ordering::SeqCst) {
+                if expected_size.is_none() {
+                    overall.note_file_size(grand_total);
+                }
+                if already > 0 {
+                    overall.inc_bytes(already);
+                }
+            }
         }
     }
 
