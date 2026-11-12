@@ -16,11 +16,13 @@ pub mod cli;
 pub mod common;
 pub mod config;
 pub mod pride;
+pub mod proteomexchange;
 pub mod repository;
 pub mod validate;
 
 pub use common::ConcurrencyLimits;
 pub use config::{CliOverrides, Config, DownloadRequest, ResolvedConfig};
 pub use pride::Pride;
+pub use proteomexchange::{HostingRepository, PxDatasetInfo};
 pub use repository::Repository;
 pub use validate::{fetch_checksums, validate_checksums, validate_file};

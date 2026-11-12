@@ -14,6 +14,7 @@ use log::{info, warn};
 
 use crate::common;
 use crate::config::{CONFIG_FILE_NAME, CliOverrides, Config, DownloadRequest, ResolvedConfig};
+use crate::proteomexchange;
 use crate::{Pride, Repository};
 
 // ---------------------------------------------------------------------------
@@ -328,6 +329,7 @@ async fn cmd_dataset(
     accession: &str,
     multi: &MultiProgress,
 ) -> Result<()> {
+    ensure_supported_repository(client, config, accession).await?;
     let count = Pride::download_dataset(client, config, limits, accession, &config.output, multi)
         .await
         .with_context(|| format!("failed to download dataset {accession}"))?;
@@ -340,6 +342,7 @@ async fn cmd_dataset(
 
 /// Prints the RAW file list for `accession`.
 async fn cmd_files(client: &reqwest::Client, config: &Config, accession: &str) -> Result<()> {
+    ensure_supported_repository(client, config, accession).await?;
     let files = Pride::get_file_list(client, config, accession)
         .await
         .with_context(|| format!("failed to fetch file list for {accession}"))?;
@@ -372,6 +375,7 @@ async fn cmd_file_by_name(
     file_name: &str,
     multi: &MultiProgress,
 ) -> Result<()> {
+    ensure_supported_repository(client, config, accession).await?;
     let files = Pride::get_file_list(client, config, accession)
         .await
         .with_context(|| format!("failed to fetch file list for {accession}"))?;
@@ -439,6 +443,22 @@ async fn cmd_file_by_url(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Resolves `accession` through ProteomeXchange and checks that pxdprowl can
+/// download from the hosting repository (only PRIDE is supported so far).
+///
+/// # Errors
+///
+/// Returns an error if the ProteomeXchange lookup fails, or if the dataset is
+/// hosted on a repository pxdprowl does not support yet.
+async fn ensure_supported_repository(
+    client: &reqwest::Client,
+    config: &Config,
+    accession: &str,
+) -> Result<()> {
+    let info = proteomexchange::resolve(client, config, accession).await?;
+    proteomexchange::ensure_supported(accession, &info.hosting_repository())
+}
 
 /// Deduplicates the batch's download requests, keeping the first occurrence
 /// of each. With concurrent execution, two tasks fetching the same file would

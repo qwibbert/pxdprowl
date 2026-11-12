@@ -11,6 +11,15 @@ A Rust based utility for downloading datasets from [PRIDE Archive](https://www.e
 ## Library
 pxdprowl can be used as a library. See
 
+# Dataset resolution
+PXD accessions are issued by [ProteomeXchange](https://www.proteomexchange.org),
+which spans several repositories (PRIDE, MassIVE, iProX, jPOST, Panorama
+Public, PeptideAtlas) — a PXD id does not imply the data is in PRIDE. Before
+downloading, `pxdprowl` asks ProteomeXchange (PROXI API) which repository
+hosts the dataset and delegates to that repository's downloader. Only PRIDE
+is implemented so far: a dataset hosted elsewhere (e.g. PXD004584, hosted on
+MassIVE) fails with a clear message naming the repository.
+
 # Configuration
 The binary reads an optional TOML config file: the path given with
 `-c`/`--config`, or `./pxdprowl.toml` in the current directory when present.
