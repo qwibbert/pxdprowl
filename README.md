@@ -2,7 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/pxdprowl)](https://crates.io/crates/pxdprowl)
 [![docs.rs](https://img.shields.io/docsrs/pxdprowl)](https://docs.rs/pxdprowl)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/qwibbert/pxdprowl/blob/master/LICENSE)
 
 Download proteomics datasets by **PXD accession** from the
 [ProteomeXchange](https://www.proteomexchange.org) repositories — **PRIDE**,
@@ -181,4 +181,4 @@ the shared download engine), the per-repository implementations `pride`,
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](https://github.com/qwibbert/pxdprowl/blob/master/LICENSE).
