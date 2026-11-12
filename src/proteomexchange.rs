@@ -66,7 +66,7 @@ impl HostingRepository {
 
     /// Whether pxdprowl can download from this repository yet.
     pub fn is_supported(&self) -> bool {
-        matches!(self, Self::Pride)
+        matches!(self, Self::Pride | Self::Massive | Self::Iprox)
     }
 }
 
@@ -139,7 +139,7 @@ pub fn ensure_supported(accession: &str, repo: &HostingRepository) -> Result<()>
         Ok(())
     } else {
         bail!(
-            "dataset {accession} is hosted on {} via ProteomeXchange; pxdprowl currently supports only PRIDE",
+            "dataset {accession} is hosted on {} via ProteomeXchange; pxdprowl currently supports PRIDE, MassIVE and iProX",
             repo.name()
         );
     }
@@ -300,21 +300,25 @@ mod tests {
     }
 
     #[test]
-    fn only_pride_is_supported() {
+    fn pride_massive_and_iprox_are_supported() {
         assert!(HostingRepository::Pride.is_supported());
-        assert!(!HostingRepository::Massive.is_supported());
-        assert!(!HostingRepository::Iprox.is_supported());
+        assert!(HostingRepository::Massive.is_supported());
+        assert!(HostingRepository::Iprox.is_supported());
+        assert!(!HostingRepository::Jpost.is_supported());
+        assert!(!HostingRepository::PanoramaPublic.is_supported());
+        assert!(!HostingRepository::PeptideAtlas.is_supported());
         assert!(!HostingRepository::Other("x".to_string()).is_supported());
     }
 
     #[test]
     fn ensure_supported_names_the_hosting_repository() {
         assert!(ensure_supported("PXD000001", &HostingRepository::Pride).is_ok());
-        let err = ensure_supported("PXD004584", &HostingRepository::Massive).unwrap_err();
+        assert!(ensure_supported("PXD004584", &HostingRepository::Massive).is_ok());
+        let err = ensure_supported("PXD999999", &HostingRepository::Jpost).unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("PXD004584"), "message was: {msg}");
-        assert!(msg.contains("MassIVE"), "message was: {msg}");
-        assert!(msg.contains("only PRIDE"), "message was: {msg}");
+        assert!(msg.contains("PXD999999"), "message was: {msg}");
+        assert!(msg.contains("jPOST"), "message was: {msg}");
+        assert!(msg.contains("PRIDE, MassIVE and iProX"), "message was: {msg}");
     }
 
     #[test]

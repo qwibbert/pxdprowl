@@ -16,9 +16,30 @@ PXD accessions are issued by [ProteomeXchange](https://www.proteomexchange.org),
 which spans several repositories (PRIDE, MassIVE, iProX, jPOST, Panorama
 Public, PeptideAtlas) — a PXD id does not imply the data is in PRIDE. Before
 downloading, `pxdprowl` asks ProteomeXchange (PROXI API) which repository
-hosts the dataset and delegates to that repository's downloader. Only PRIDE
-is implemented so far: a dataset hosted elsewhere (e.g. PXD004584, hosted on
-MassIVE) fails with a clear message naming the repository.
+hosts the dataset and delegates to that repository's downloader.
+
+Supported so far: **PRIDE**, **MassIVE** and **iProX**. A dataset hosted on any
+other repository (e.g. a jPOST one) fails with a clear message naming the
+repository. For every dataset, only the RAW files are listed/downloaded
+(PRIDE `RAW` category; MassIVE `raw/` collection; iProX "Associated raw file
+URI" entries), and each file's relative path is preserved under
+`output/{PXD}/` (e.g. `output/PXD004584/raw/Replicate 1/a.raw`).
+
+Integrity: PRIDE publishes an MD5 checksum TSV per dataset, so PRIDE downloads
+are MD5-validated. MassIVE and iProX publish no per-file checksums, so their
+downloads are validated by size (the listing's reported size / HTTP
+`Content-Length`) instead.
+
+MassIVE notes: files are served over HTTPS via the ProteoSAFe
+`DownloadResultFile` endpoint (the FTPS server is not used), which
+rate-limits parallel requests — pxdprowl therefore serializes MassIVE
+downloads and honors `Retry-After` on HTTP 429. MassIVE responses are chunked
+(no `Content-Length`), so progress-bar totals come from the file index's
+reported sizes.
+
+iProX notes: file URLs recorded as `download.iprox.org` are rewritten to
+`https://download.iprox.cn` (same server; the `.org` host's certificate is
+only valid for `*.iprox.cn`, so HTTPS to it fails verification).
 
 # Configuration
 The binary reads an optional TOML config file: the path given with

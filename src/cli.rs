@@ -14,8 +14,8 @@ use log::{info, warn};
 
 use crate::common;
 use crate::config::{CONFIG_FILE_NAME, CliOverrides, Config, DownloadRequest, ResolvedConfig};
-use crate::proteomexchange;
-use crate::{Pride, Repository};
+use crate::proteomexchange::{self, HostingRepository};
+use crate::repository::{self, Repo, Repository};
 
 // ---------------------------------------------------------------------------
 // Argument types
@@ -320,8 +320,9 @@ async fn cmd_download(
     }
 }
 
-/// Downloads every RAW file of `accession` into `output/{accession}/` and
-/// validates checksums.
+/// Downloads every RAW file of `accession` into `output/{accession}/`,
+/// preserving each file's relative path, and validates them (MD5 checksums
+/// for PRIDE, size for MassIVE/iProX).
 async fn cmd_dataset(
     client: &reqwest::Client,
     config: &Config,
@@ -329,8 +330,14 @@ async fn cmd_dataset(
     accession: &str,
     multi: &MultiProgress,
 ) -> Result<()> {
-    ensure_supported_repository(client, config, accession).await?;
-    let count = Pride::download_dataset(client, config, limits, accession, &config.output, multi)
+    let (repo, repo_id) = resolve_repo(client, config, accession).await?;
+    let target = repository::DatasetTarget {
+        repo_id: &repo_id,
+        label: accession,
+        dest: &config.output,
+        gate: repo.download_gate(),
+    };
+    let count = repository::download_dataset(repo, client, config, limits, &target, multi)
         .await
         .with_context(|| format!("failed to download dataset {accession}"))?;
     println!(
@@ -342,8 +349,9 @@ async fn cmd_dataset(
 
 /// Prints the RAW file list for `accession`.
 async fn cmd_files(client: &reqwest::Client, config: &Config, accession: &str) -> Result<()> {
-    ensure_supported_repository(client, config, accession).await?;
-    let files = Pride::get_file_list(client, config, accession)
+    let (repo, repo_id) = resolve_repo(client, config, accession).await?;
+    let files = repo
+        .get_file_list(client, config, &repo_id)
         .await
         .with_context(|| format!("failed to fetch file list for {accession}"))?;
 
@@ -352,12 +360,12 @@ async fn cmd_files(client: &reqwest::Client, config: &Config, accession: &str) -
         return Ok(());
     }
 
-    let name_width = files.iter().map(|f| f.file_name.len()).max().unwrap_or(0);
+    let name_width = files.iter().map(|f| f.relative_path.len()).max().unwrap_or(0);
     for file in &files {
-        let size = file.file_size.map_or_else(|| "?".to_string(), format_size);
+        let size = file.size.map_or_else(|| "?".to_string(), format_size);
         println!(
             "{:<name_width$}  {:>12}",
-            file.file_name,
+            file.relative_path,
             size,
             name_width = name_width
         );
@@ -366,7 +374,8 @@ async fn cmd_files(client: &reqwest::Client, config: &Config, accession: &str) -
     Ok(())
 }
 
-/// Downloads a single file identified by `accession` + `file_name`.
+/// Downloads a single file identified by `accession` + `file_name` (matched
+/// by basename or relative path within the dataset).
 async fn cmd_file_by_name(
     client: &reqwest::Client,
     config: &Config,
@@ -375,26 +384,27 @@ async fn cmd_file_by_name(
     file_name: &str,
     multi: &MultiProgress,
 ) -> Result<()> {
-    ensure_supported_repository(client, config, accession).await?;
-    let files = Pride::get_file_list(client, config, accession)
+    let (repo, repo_id) = resolve_repo(client, config, accession).await?;
+    let files = repo
+        .get_file_list(client, config, &repo_id)
         .await
         .with_context(|| format!("failed to fetch file list for {accession}"))?;
 
     let file = files
         .iter()
-        .find(|f| f.file_name == file_name)
+        .find(|f| f.name == file_name || f.relative_path == file_name)
         .with_context(|| format!("file '{file_name}' not found in dataset {accession}"))?;
 
-    let url = file.https_url();
-    if url.is_empty() {
-        bail!("no downloadable HTTPS URL for '{file_name}' in {accession}");
+    if file.url.is_empty() {
+        bail!("no downloadable URL for '{file_name}' in {accession}");
     }
 
-    let dest_dir = config.output.join(accession);
-    tokio::fs::create_dir_all(&dest_dir)
-        .await
-        .with_context(|| format!("failed to create {}", dest_dir.display()))?;
-    let dest = dest_dir.join(file_name);
+    let dest = config.output.join(accession).join(&file.relative_path);
+    if let Some(parent) = dest.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
 
     // Count against the global download cap, like dataset files do.
     let _permit = limits
@@ -403,7 +413,7 @@ async fn cmd_file_by_name(
         .acquire_owned()
         .await
         .context("download semaphore closed unexpectedly")?;
-    Pride::download_file(client, config, &url, &dest, multi).await?;
+    repository::download_file(client, config, &file.url, &dest, multi, file.size).await?;
     println!("Downloaded {file_name} -> {}", dest.display());
     Ok(())
 }
@@ -435,7 +445,7 @@ async fn cmd_file_by_url(
         .acquire_owned()
         .await
         .context("download semaphore closed unexpectedly")?;
-    Pride::download_file(client, config, url, &dest, multi).await?;
+    repository::download_file(client, config, url, &dest, multi, None).await?;
     println!("Downloaded {file_name} -> {}", dest.display());
     Ok(())
 }
@@ -444,20 +454,35 @@ async fn cmd_file_by_url(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Resolves `accession` through ProteomeXchange and checks that pxdprowl can
-/// download from the hosting repository (only PRIDE is supported so far).
+/// Resolves a PXD `accession` through ProteomeXchange to the repository
+/// hosting it, plus the repository-local id its API is keyed by (the `MSV...`
+/// id for MassIVE; the PXD id itself for PRIDE and iProX).
 ///
 /// # Errors
 ///
-/// Returns an error if the ProteomeXchange lookup fails, or if the dataset is
-/// hosted on a repository pxdprowl does not support yet.
-async fn ensure_supported_repository(
-    client: &reqwest::Client,
-    config: &Config,
-    accession: &str,
-) -> Result<()> {
+/// Returns an error if the ProteomeXchange lookup fails, if the dataset is
+/// hosted on a repository pxdprowl does not support, or if a MassIVE-hosted
+/// record carries no `MSV...` id.
+async fn resolve_repo(client: &reqwest::Client, config: &Config, accession: &str) -> Result<(Repo, String)> {
     let info = proteomexchange::resolve(client, config, accession).await?;
-    proteomexchange::ensure_supported(accession, &info.hosting_repository())
+    let host = info.hosting_repository();
+    let repo = match host {
+        HostingRepository::Pride => Repo::Pride,
+        HostingRepository::Massive => Repo::Massive,
+        HostingRepository::Iprox => Repo::Iprox,
+        other => bail!(
+            "dataset {accession} is hosted on {} via ProteomeXchange; pxdprowl currently supports PRIDE, MassIVE and iProX",
+            other.name()
+        ),
+    };
+    let repo_id = match repo {
+        Repo::Massive => info
+            .repository_id()
+            .map(str::to_string)
+            .with_context(|| format!("ProteomeXchange record for {accession} has no MassIVE id"))?,
+        _ => accession.to_string(),
+    };
+    Ok((repo, repo_id))
 }
 
 /// Deduplicates the batch's download requests, keeping the first occurrence

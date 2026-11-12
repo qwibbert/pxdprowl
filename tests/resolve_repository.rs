@@ -27,6 +27,15 @@ const MASSIVE_RECORD: &str = r#"{
     ]
 }"#;
 
+const JPOST_RECORD: &str = r#"{
+    "title": "some jPOST dataset",
+    "datasetSummary": {"hostingRepository": "jPOST"},
+    "identifiers": [
+        {"accession": "MS:1002632", "name": "jPOST dataset identifier", "value": "JPST001234567"},
+        {"accession": "MS:1001919", "name": "ProteomeXchange accession number", "value": "PXD900001"}
+    ]
+}"#;
+
 const EMBARGOED_BODY: &str =
     r#"{"error_code": "DatasetNotYetReleased", "repository": "PRIDE", "description": "embargoed"}"#;
 const UNKNOWN_BODY: &str = r#"{"error_code": "DatasetNotFound", "description": "no such dataset"}"#;
@@ -53,6 +62,7 @@ fn spawn_proxi_mock() -> (u16, std::thread::JoinHandle<()>) {
                 let (status, reason, body) = match path.as_str() {
                     "/datasets/PXD000001" => (200, "OK", PRIDE_RECORD.to_string()),
                     "/datasets/PXD004584" => (200, "OK", MASSIVE_RECORD.to_string()),
+                    "/datasets/PXD900001" => (200, "OK", JPOST_RECORD.to_string()),
                     "/datasets/PXD082740" => (404, "Not Found", EMBARGOED_BODY.to_string()),
                     "/datasets/PXD999999999" => (404, "Not Found", UNKNOWN_BODY.to_string()),
                     _ => (404, "Not Found", UNKNOWN_BODY.to_string()),
@@ -94,7 +104,7 @@ async fn resolves_pride_dataset_as_supported() {
 }
 
 #[tokio::test]
-async fn resolves_massive_dataset_with_repo_id_and_unsupported() {
+async fn resolves_massive_dataset_with_repo_id_and_supported() {
     let (port, server) = spawn_proxi_mock();
     let client = reqwest::Client::new();
     let base = format!("http://127.0.0.1:{port}");
@@ -105,11 +115,27 @@ async fn resolves_massive_dataset_with_repo_id_and_unsupported() {
 
     assert_eq!(info.hosting_repository(), HostingRepository::Massive);
     assert_eq!(info.repository_id(), Some("MSV000079263"));
-    let err = proteomexchange::ensure_supported("PXD004584", &info.hosting_repository())
+    assert!(proteomexchange::ensure_supported("PXD004584", &info.hosting_repository()).is_ok());
+    drop(server);
+}
+
+#[tokio::test]
+async fn unsupported_repository_still_errors_with_name() {
+    let (port, server) = spawn_proxi_mock();
+    let client = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{port}");
+
+    let info = proteomexchange::resolve_with_base(&client, &test_config(), "PXD900001", &base)
+        .await
+        .unwrap();
+
+    assert_eq!(info.hosting_repository(), HostingRepository::Jpost);
+    assert_eq!(info.repository_id(), Some("JPST001234567"));
+    let err = proteomexchange::ensure_supported("PXD900001", &info.hosting_repository())
         .unwrap_err();
     let msg = format!("{err:#}");
-    assert!(msg.contains("PXD004584"), "message was: {msg}");
-    assert!(msg.contains("MassIVE"), "message was: {msg}");
+    assert!(msg.contains("PXD900001"), "message was: {msg}");
+    assert!(msg.contains("jPOST"), "message was: {msg}");
     drop(server);
 }
 

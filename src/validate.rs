@@ -80,17 +80,17 @@ pub async fn validate_file(
     limits: &Arc<common::ConcurrencyLimits>,
     accession: &str,
     output_dir: &Path,
-    file_name: &str,
+    rel_path: &str,
     expected: &str,
     file_size: u64,
     multi: &MultiProgress,
 ) -> Result<()> {
-    let path = output_dir.join(file_name);
+    let path = output_dir.join(rel_path);
 
     // Per-file byte bar for MD5 reading progress.
     let md5_pb = multi.add(ProgressBar::new(file_size));
     md5_pb.set_style(common::bytes_style());
-    md5_pb.set_prefix(format!("MD5 {file_name}"));
+    md5_pb.set_prefix(format!("MD5 {rel_path}"));
 
     let guard = limits.validations.acquire().await;
     let md5_result = {
@@ -108,24 +108,52 @@ pub async fn validate_file(
     let actual = match md5_result {
         Ok(actual) => actual,
         Err(e) => {
-            warn!("{accession}/{file_name}: failed to compute MD5: {e:#}");
-            return Err(e).context(format!("{accession}/{file_name}: failed to compute MD5"));
+            warn!("{accession}/{rel_path}: failed to compute MD5: {e:#}");
+            return Err(e).context(format!("{accession}/{rel_path}: failed to compute MD5"));
         }
     };
 
     if actual.eq_ignore_ascii_case(expected) {
-        info!("{accession}/{file_name}: checksum OK");
+        info!("{accession}/{rel_path}: checksum OK");
         return Ok(());
     }
 
-    warn!("{accession}/{file_name}: checksum mismatch (expected {expected}, got {actual})");
+    warn!("{accession}/{rel_path}: checksum mismatch (expected {expected}, got {actual})");
     match tokio::fs::remove_file(&path).await {
         Ok(()) => {
-            info!("{accession}/{file_name}: removed corrupt file, will re-download on next run")
+            info!("{accession}/{rel_path}: removed corrupt file, will re-download on next run")
         }
-        Err(e) => warn!("{accession}/{file_name}: failed to remove corrupt file: {e}"),
+        Err(e) => warn!("{accession}/{rel_path}: failed to remove corrupt file: {e}"),
     }
-    bail!("{accession}/{file_name}: checksum mismatch (expected {expected}, got {actual})")
+    bail!("{accession}/{rel_path}: checksum mismatch (expected {expected}, got {actual})")
+}
+
+/// Validates a downloaded file by size. Used for repositories that publish no
+/// checksums (MassIVE, iProX): the listing's reported size is compared to the
+/// on-disk size. On mismatch the file is deleted so the next run re-downloads
+/// it instead of skipping it via the exists() check.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be statted or its size differs from
+/// `expected`.
+pub async fn validate_size(label: &str, path: &Path, expected: u64) -> Result<()> {
+    let actual = tokio::fs::metadata(path)
+        .await
+        .with_context(|| format!("failed to stat {}", path.display()))?
+        .len();
+    if actual == expected {
+        info!("{label}: size OK ({actual} bytes)");
+        return Ok(());
+    }
+    warn!("{label}: size mismatch (expected {expected}, got {actual})");
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => {
+            info!("{label}: removed incomplete file, will re-download on next run")
+        }
+        Err(e) => warn!("{label}: failed to remove incomplete file: {e}"),
+    }
+    bail!("{label}: size mismatch (expected {expected}, got {actual})")
 }
 
 /// Fetches the PRIDE checksum TSV and validates MD5 of every file in `files`
@@ -143,7 +171,7 @@ pub async fn validate_checksums(
     limits: &Arc<common::ConcurrencyLimits>,
     accession: &str,
     output_dir: &Path,
-    files: &[common::PrideFile],
+    files: &[common::RemoteFile],
     multi: &MultiProgress,
 ) -> Result<()> {
     let checksums = fetch_checksums(client, config, accession).await?;
@@ -162,15 +190,15 @@ pub async fn validate_checksums(
     // spawn_blocking.
     let mut set = tokio::task::JoinSet::new();
     for file in files {
-        let file_name = file.file_name.clone();
-        let Some(expected) = checksums.get(&file_name).cloned() else {
-            warn!("{accession}/{file_name}: no checksum found, skipping");
+        let rel_path = file.relative_path.clone();
+        let Some(expected) = checksums.get(&file.name).cloned() else {
+            warn!("{accession}/{rel_path}: no checksum found, skipping");
             val_bar.inc(1);
             continue;
         };
-        let path = output_dir.join(&file_name);
+        let path = output_dir.join(&rel_path);
         let file_size = file
-            .file_size
+            .size
             .unwrap_or_else(|| std::fs::metadata(&path).map_or(0, |m| m.len()));
 
         let limits = limits.clone();
@@ -183,14 +211,14 @@ pub async fn validate_checksums(
                 &limits,
                 &accession,
                 &output_dir,
-                &file_name,
+                &rel_path,
                 &expected,
                 file_size,
                 &multi,
             )
             .await;
             val_bar.inc(1);
-            (file_name, result)
+            (rel_path, result)
         });
     }
 
@@ -371,6 +399,27 @@ mod tests {
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("failed to compute MD5"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn validate_size_accepts_matching_size() {
+        let dir = temp_dir("size-ok");
+        std::fs::write(dir.join("a.raw"), b"hello").unwrap();
+        validate_size("PXD000001", &dir.join("a.raw"), 5).await.unwrap();
+        assert!(dir.join("a.raw").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn validate_size_deletes_file_and_errors_on_mismatch() {
+        let dir = temp_dir("size-mismatch");
+        std::fs::write(dir.join("a.raw"), b"hello").unwrap();
+        let err = validate_size("PXD000001", &dir.join("a.raw"), 999)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("size mismatch"));
+        assert!(!dir.join("a.raw").exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

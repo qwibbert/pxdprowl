@@ -74,6 +74,24 @@ impl PrideFile {
     }
 }
 
+/// A file available for download from any repository, in repository-neutral
+/// terms. Repositories map their own listing records onto this type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteFile {
+    /// Basename of the file, e.g. `sample.raw`.
+    pub name: String,
+    /// Path of the file relative to the dataset's output directory, e.g.
+    /// `raw/sample.raw`. Equal to `name` for repositories with a flat layout
+    /// (PRIDE). Subpaths are preserved on download to avoid collisions.
+    pub relative_path: String,
+    /// Direct download URL.
+    pub url: String,
+    /// Expected size in bytes, when the repository's listing reports it.
+    pub size: Option<u64>,
+    /// Repository-specific file category, e.g. `RAW`.
+    pub category: Option<String>,
+}
+
 /// Retries an idempotent operation with exponential backoff. Used for both
 /// file downloads (resume via `.part`) and small API GETs (no resume needed).
 /// The attempt count comes from [`Config::max_retries`](crate::config::Config::max_retries).

@@ -15,14 +15,18 @@
 pub mod cli;
 pub mod common;
 pub mod config;
+pub mod iprox;
+pub mod massive;
 pub mod pride;
 pub mod proteomexchange;
 pub mod repository;
 pub mod validate;
 
-pub use common::ConcurrencyLimits;
+pub use common::{ConcurrencyLimits, RemoteFile};
 pub use config::{CliOverrides, Config, DownloadRequest, ResolvedConfig};
+pub use iprox::Iprox;
+pub use massive::Massive;
 pub use pride::Pride;
 pub use proteomexchange::{HostingRepository, PxDatasetInfo};
-pub use repository::Repository;
-pub use validate::{fetch_checksums, validate_checksums, validate_file};
+pub use repository::{Repo, Repository};
+pub use validate::{fetch_checksums, validate_checksums, validate_file, validate_size};
