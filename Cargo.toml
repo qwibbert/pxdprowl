@@ -11,6 +11,7 @@ readme = "README.md"
 documentation = "https://docs.rs/pxdprowl"
 keywords = ["proteomics", "mass-spectrometry", "pride", "proteomeexchange", "massive"]
 categories = ["command-line-utilities", "science"]
+exclude = ["Cargo.toml.orig"]
 
 [lints.clippy]
 correctness = "deny"
