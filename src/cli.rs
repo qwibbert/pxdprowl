@@ -55,6 +55,8 @@ pub struct Args {
     #[arg(long, global = true, value_name = "N")]
     pub max_retries: Option<usize>,
 
+    /// The subcommand to execute.
+    /// When not specified, check if a config file is present.
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
@@ -62,21 +64,23 @@ pub struct Args {
 /// The available subcommands.
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// Download all RAW files of a PRIDE dataset.
+    /// Download all RAW files of a ProteomeXchange dataset.
     Dataset {
-        /// PRIDE accession, e.g. `PXD000001`.
+        /// ProteomeXchange accession, e.g. `PXD000001`.
         accession: String,
     },
 
-    /// List the RAW files available for a PRIDE dataset.
+    /// List the RAW files available for a ProteomeXchange dataset.
     Files {
-        /// PRIDE accession, e.g. `PXD000001`.
+        /// ProteomeXchange accession, e.g. `PXD000001`.
         accession: String,
     },
 
-    /// Download a single file.
+    /// Download a single file from a ProteomeXchange dataset.
     File {
         #[command(subcommand)]
+        /// ProteomeXchange dataset accession + filename
+        /// or file URL
         source: FileSource,
     },
 }

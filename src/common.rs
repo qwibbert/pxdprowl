@@ -42,23 +42,30 @@ pub const DOWNLOAD_READ_TIMEOUT: std::time::Duration = std::time::Duration::from
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PrideFile {
+    /// The name of the file reported by PRIDE.
     pub file_name: String,
+    /// The category (e.g. RAW, SEARCH) reported by PRIDE.
     pub file_category: Option<Category>,
     #[serde(rename = "publicFileLocations", default)]
+    /// The possible download URLs for the file.
     pub locations: Vec<FileLocation>,
+    /// The size of the file as reported by PRIDE.
     pub file_size: Option<u64>,
 }
 
 /// The `fileCategory` object of a [`PrideFile`].
 #[derive(Debug, Clone, Deserialize)]
 pub struct Category {
+    /// The category (e.g. RAW, SEARCH) reported by PRIDE.
     pub value: String,
 }
 
 /// A single entry of `publicFileLocations` in a [`PrideFile`].
 #[derive(Debug, Clone, Deserialize)]
 pub struct FileLocation {
+    /// The name of the location.
     pub name: String,
+    /// The URL of the location.
     pub value: String,
 }
 
