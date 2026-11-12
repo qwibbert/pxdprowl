@@ -161,7 +161,7 @@ pub async fn download_file(
     config: &Config,
     url: &str,
     dest: &Path,
-    multi: &MultiProgress,
+    bars: &FileBars,
     expected_size: Option<u64>,
 ) -> Result<()> {
     let file_name = dest
@@ -171,6 +171,9 @@ pub async fn download_file(
 
     if dest.exists() {
         info!("Skipping {file_name} (already exists)");
+        if let Some(overall) = &bars.overall {
+            overall.inc_bytes(expected_size.unwrap_or(0));
+        }
         return Ok(());
     }
 
@@ -188,9 +191,9 @@ pub async fn download_file(
             let dest = dest.to_path_buf();
             let tmp = tmp.clone();
             let file_name = file_name.clone();
-            let multi = multi.clone();
+            let bars = bars.clone();
             async move {
-                try_download_once(&client, &url, &dest, &tmp, &file_name, &multi, expected_size)
+                try_download_once(&client, &url, &dest, &tmp, &file_name, &bars, expected_size)
                     .await
             }
         })
@@ -231,6 +234,87 @@ pub struct DatasetTarget<'a> {
 /// checksums, `Ok(None)` when it publishes none, `Err` when the fetch failed.
 type ChecksumCell = Arc<tokio::sync::OnceCell<Result<Option<HashMap<String, String>>>>>;
 
+/// The dataset-wide overall progress bar.
+///
+/// Byte-driven when the listing reports file sizes (total = sum of sizes), so
+/// its ETA is meaningful from the first byte — a pure count bar would show
+/// `ETA 0s` until the first file completes, because indicatif estimates ETA
+/// from the completed-items rate. Falls back to count-driven when no sizes
+/// are known. The file count is shown in the prefix.
+#[derive(Clone)]
+pub struct OverallBar {
+    bar: ProgressBar,
+    byte_driven: bool,
+    total_files: u64,
+    done: Arc<std::sync::atomic::AtomicU64>,
+    label: String,
+}
+
+impl OverallBar {
+    /// Creates the overall bar for a dataset of `files` under `label`.
+    pub fn new(multi: &MultiProgress, label: &str, files: &[common::RemoteFile]) -> Self {
+        let total_bytes: u64 = files.iter().map(|f| f.size.unwrap_or(0)).sum();
+        let byte_driven = total_bytes > 0;
+        let bar = if byte_driven {
+            multi.add(ProgressBar::new(total_bytes))
+        } else {
+            multi.add(ProgressBar::new(files.len() as u64))
+        };
+        bar.set_style(if byte_driven {
+            common::bytes_style()
+        } else {
+            common::count_style()
+        });
+        bar.set_prefix(format!("{label} download (0/{} files)", files.len()));
+        Self {
+            bar,
+            byte_driven,
+            total_files: files.len() as u64,
+            done: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            label: label.to_string(),
+        }
+    }
+
+    /// Adds `n` downloaded bytes (byte-driven mode only).
+    pub fn inc_bytes(&self, n: u64) {
+        if self.byte_driven {
+            self.bar.inc(n);
+        }
+    }
+
+    /// Marks one file finished: bumps the prefix count (byte mode) or the
+    /// bar position (count mode).
+    pub fn inc_file(&self) {
+        use std::sync::atomic::Ordering;
+        let done = self.done.fetch_add(1, Ordering::Relaxed) + 1;
+        if self.byte_driven {
+            self.bar.set_prefix(format!(
+                "{} download ({done}/{} files)",
+                self.label, self.total_files
+            ));
+        } else {
+            self.bar.inc(1);
+        }
+    }
+
+    /// Finishes and clears the bar.
+    pub fn finish(&self) {
+        self.bar.finish_and_clear();
+    }
+}
+
+/// Progress bars threaded through a single-file download: the
+/// [`MultiProgress`] for the per-file byte bar, plus the optional
+/// dataset-wide [`OverallBar`]. Owned (cheap clones) so it can move into
+/// spawned tasks.
+#[derive(Clone)]
+pub struct FileBars {
+    /// The multi-progress the per-file bar is added to.
+    pub multi: MultiProgress,
+    /// The dataset-wide overall bar, when downloading within a dataset run.
+    pub overall: Option<OverallBar>,
+}
+
 /// Downloads every listed file of the dataset `target` into
 /// `dest/{label}/`, preserving each file's relative path, and validates each
 /// file inline as soon as its own download completes — by MD5 checksum when
@@ -265,10 +349,9 @@ pub async fn download_dataset<R: Repository>(
     let output_dir = dest.join(label);
     tokio::fs::create_dir_all(&output_dir).await?;
 
-    // Per-dataset file-count bar.
-    let dl_bar = multi.add(ProgressBar::new(files.len() as u64));
-    dl_bar.set_style(common::count_style());
-    dl_bar.set_prefix(format!("{label} download"));
+    // Overall dataset bar: byte-driven when the listing reports sizes (so the
+    // ETA is meaningful from the first byte), count-driven otherwise.
+    let overall = OverallBar::new(multi, label, &files);
 
     // Fetch the checksums concurrently with the downloads: each file is
     // validated inline as soon as its own download completes, so the
@@ -323,7 +406,10 @@ pub async fn download_dataset<R: Repository>(
             tokio::fs::create_dir_all(parent).await?;
         }
         let multi = multi.clone();
-        let dl_bar = dl_bar.clone();
+        let bars = FileBars {
+            multi: multi.clone(),
+            overall: Some(overall.clone()),
+        };
         let checksums = checksums.clone();
         let output_dir = output_dir.clone();
         set.spawn(async move {
@@ -332,9 +418,11 @@ pub async fn download_dataset<R: Repository>(
             let result = {
                 let _permit = permit;
                 let _gate_permit = gate_permit;
-                download_file(&client, &config, &file.url, &dest, &multi, file.size).await
+                download_file(&client, &config, &file.url, &dest, &bars, file.size).await
             };
-            dl_bar.inc(1);
+            if let Some(overall) = &bars.overall {
+                overall.inc_file();
+            }
             // Validate inline, overlapping the remaining downloads.
             let validation = match &result {
                 Ok(()) => {
@@ -378,7 +466,7 @@ pub async fn download_dataset<R: Repository>(
             }
         }
     }
-    dl_bar.finish_and_clear();
+    overall.finish();
 
     // Surface a failed checksum fetch only now (after the downloads), matching
     // the previous validate-after-download ordering.
@@ -484,9 +572,10 @@ async fn try_download_once(
     dest: &Path,
     tmp: &Path,
     file_name: &str,
-    multi: &MultiProgress,
+    bars: &FileBars,
     expected_size: Option<u64>,
 ) -> Result<()> {
+    let multi = &bars.multi;
     // Resume support: if a .part file exists from a previous interrupted
     // download, ask the server for the remaining bytes via Range header.
     let resume_from = tokio::fs::metadata(tmp).await.map_or(0, |m| m.len());
@@ -579,6 +668,9 @@ async fn try_download_once(
             Some(bytes) => {
                 file.write_all(&bytes).await?;
                 pb.inc(bytes.len() as u64);
+                if let Some(overall) = &bars.overall {
+                    overall.inc_bytes(bytes.len() as u64);
+                }
             }
             None => break,
         }
@@ -661,6 +753,30 @@ mod tests {
             size,
             category: Some("RAW".to_string()),
         }
+    }
+
+    #[test]
+    fn overall_bar_is_byte_driven_when_sizes_are_known() {
+        let multi = MultiProgress::new();
+        let files = vec![remote_file("raw/a.raw", Some(5)), remote_file("raw/b.raw", Some(3))];
+        let overall = OverallBar::new(&multi, "PXD000001", &files);
+        assert!(overall.byte_driven);
+        assert_eq!(overall.bar.length(), Some(8));
+        overall.inc_bytes(5);
+        overall.inc_file();
+        assert_eq!(overall.bar.position(), 5);
+    }
+
+    #[test]
+    fn overall_bar_falls_back_to_counts_when_sizes_unknown() {
+        let multi = MultiProgress::new();
+        let files = vec![remote_file("a.raw", None), remote_file("b.raw", None)];
+        let overall = OverallBar::new(&multi, "PXD000001", &files);
+        assert!(!overall.byte_driven);
+        assert_eq!(overall.bar.length(), Some(2));
+        overall.inc_bytes(999); // no-op in count mode
+        overall.inc_file();
+        assert_eq!(overall.bar.position(), 1);
     }
 
     /// Builds an InlineValidation whose checksum cell is pre-set, so no

@@ -363,12 +363,13 @@ async fn download_uses_listing_size_when_server_sends_no_content_length() {
 
     // Chunked response (no Content-Length), like MassIVE's servlet: the
     // listing-reported size drives the progress bar and completeness check.
+    let bars = repository::FileBars { multi: multi.clone(), overall: None };
     repository::download_file(
         &client,
         &config,
         &format!("{base}/dl/chunked.raw"),
         &dest,
-        &multi,
+        &bars,
         Some(5),
     )
     .await
@@ -390,12 +391,13 @@ async fn download_waits_out_429_and_succeeds_on_retry() {
     let dest = dir.join("limited.raw");
 
     // First attempt gets 429 (Retry-After: 0), the retry succeeds.
+    let bars = repository::FileBars { multi: multi.clone(), overall: None };
     repository::download_file(
         &client,
         &config,
         &format!("{base}/dl/limited.raw"),
         &dest,
-        &multi,
+        &bars,
         Some(5),
     )
     .await
@@ -417,12 +419,13 @@ async fn download_survives_more_429s_than_max_retries_via_extra_rounds() {
     let dir = temp_dir("flaky");
     let dest = dir.join("flaky.raw");
 
+    let bars = repository::FileBars { multi: multi.clone(), overall: None };
     repository::download_file(
         &client,
         &config,
         &format!("{base}/dl/flaky.raw"),
         &dest,
-        &multi,
+        &bars,
         Some(5),
     )
     .await

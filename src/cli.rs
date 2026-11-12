@@ -413,7 +413,11 @@ async fn cmd_file_by_name(
         .acquire_owned()
         .await
         .context("download semaphore closed unexpectedly")?;
-    repository::download_file(client, config, &file.url, &dest, multi, file.size).await?;
+    let bars = repository::FileBars {
+        multi: multi.clone(),
+        overall: None,
+    };
+    repository::download_file(client, config, &file.url, &dest, &bars, file.size).await?;
     println!("Downloaded {file_name} -> {}", dest.display());
     Ok(())
 }
@@ -445,7 +449,11 @@ async fn cmd_file_by_url(
         .acquire_owned()
         .await
         .context("download semaphore closed unexpectedly")?;
-    repository::download_file(client, config, url, &dest, multi, None).await?;
+    let bars = repository::FileBars {
+        multi: multi.clone(),
+        overall: None,
+    };
+    repository::download_file(client, config, url, &dest, &bars, None).await?;
     println!("Downloaded {file_name} -> {}", dest.display());
     Ok(())
 }
