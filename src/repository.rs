@@ -236,65 +236,61 @@ type ChecksumCell = Arc<tokio::sync::OnceCell<Result<Option<HashMap<String, Stri
 
 /// The dataset-wide overall progress bar.
 ///
-/// Byte-driven when the listing reports file sizes (total = sum of sizes), so
-/// its ETA is meaningful from the first byte — a pure count bar would show
-/// `ETA 0s` until the first file completes, because indicatif estimates ETA
-/// from the completed-items rate. Falls back to count-driven when no sizes
-/// are known. The file count is shown in the prefix.
+/// Byte-driven with a dynamically growing total: file sizes reported by the
+/// listing (PRIDE, MassIVE) are added upfront, and sizes discovered from the
+/// download response's `Content-Length` (iProX, whose listing has none) are
+/// added as each download starts. That way the ETA is meaningful from the
+/// first byte — a pure count bar would show `ETA 0s` until the first file
+/// completes, because indicatif estimates ETA from the completed-items rate.
+/// The file count is shown in the prefix.
 #[derive(Clone)]
 pub struct OverallBar {
     bar: ProgressBar,
-    byte_driven: bool,
     total_files: u64,
     done: Arc<std::sync::atomic::AtomicU64>,
     label: String,
 }
 
 impl OverallBar {
-    /// Creates the overall bar for a dataset of `files` under `label`.
+    /// Creates the overall bar for a dataset of `files` under `label`, adding
+    /// any listing-reported sizes to the total upfront.
     pub fn new(multi: &MultiProgress, label: &str, files: &[common::RemoteFile]) -> Self {
-        let total_bytes: u64 = files.iter().map(|f| f.size.unwrap_or(0)).sum();
-        let byte_driven = total_bytes > 0;
-        let bar = if byte_driven {
-            multi.add(ProgressBar::new(total_bytes))
-        } else {
-            multi.add(ProgressBar::new(files.len() as u64))
-        };
-        bar.set_style(if byte_driven {
-            common::bytes_style()
-        } else {
-            common::count_style()
-        });
+        let bar = multi.add(ProgressBar::new(0));
+        bar.set_style(common::bytes_style());
         bar.set_prefix(format!("{label} download (0/{} files)", files.len()));
-        Self {
+        let this = Self {
             bar,
-            byte_driven,
             total_files: files.len() as u64,
             done: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             label: label.to_string(),
+        };
+        for file in files {
+            if let Some(size) = file.size {
+                this.note_file_size(size);
+            }
         }
+        this
     }
 
-    /// Adds `n` downloaded bytes (byte-driven mode only).
+    /// Adds a newly discovered file size to the bar's total.
+    pub fn note_file_size(&self, total: u64) {
+        let len = self.bar.length().unwrap_or(0);
+        self.bar.set_length(len + total);
+    }
+
+    /// Adds `n` downloaded bytes.
     pub fn inc_bytes(&self, n: u64) {
-        if self.byte_driven {
-            self.bar.inc(n);
-        }
+        self.bar.inc(n);
     }
 
-    /// Marks one file finished: bumps the prefix count (byte mode) or the
-    /// bar position (count mode).
+    /// Marks one file finished: bumps the prefix count.
     pub fn inc_file(&self) {
         use std::sync::atomic::Ordering;
         let done = self.done.fetch_add(1, Ordering::Relaxed) + 1;
-        if self.byte_driven {
-            self.bar.set_prefix(format!(
-                "{} download ({done}/{} files)",
-                self.label, self.total_files
-            ));
-        } else {
-            self.bar.inc(1);
-        }
+        self.bar.set_prefix(format!(
+            "{} download ({done}/{} files)",
+            self.label, self.total_files
+        ));
     }
 
     /// Finishes and clears the bar.
@@ -641,6 +637,15 @@ async fn try_download_once(
         0
     };
     let grand_total = total + already;
+    // Feed the overall bar the file's size once it is known from the response
+    // (repositories whose listing has no sizes, e.g. iProX). Only on the first
+    // attempt of a fresh download, so retries don't grow the total twice.
+    // Listing-known sizes were already added upfront by OverallBar::new.
+    if resume_from == 0 && grand_total > 0 && expected_size.is_none() {
+        if let Some(overall) = &bars.overall {
+            overall.note_file_size(grand_total);
+        }
+    }
 
     // Per-file byte bar with ETA, starting at the resumed offset.
     let pb = multi.add(ProgressBar::new(grand_total));
@@ -756,11 +761,10 @@ mod tests {
     }
 
     #[test]
-    fn overall_bar_is_byte_driven_when_sizes_are_known() {
+    fn overall_bar_totals_listing_sizes_upfront() {
         let multi = MultiProgress::new();
         let files = vec![remote_file("raw/a.raw", Some(5)), remote_file("raw/b.raw", Some(3))];
         let overall = OverallBar::new(&multi, "PXD000001", &files);
-        assert!(overall.byte_driven);
         assert_eq!(overall.bar.length(), Some(8));
         overall.inc_bytes(5);
         overall.inc_file();
@@ -768,15 +772,18 @@ mod tests {
     }
 
     #[test]
-    fn overall_bar_falls_back_to_counts_when_sizes_unknown() {
+    fn overall_bar_grows_as_sizes_become_known() {
+        // iProX-style listing without sizes: the total starts at 0 and grows
+        // as each file's Content-Length is discovered at download time.
         let multi = MultiProgress::new();
         let files = vec![remote_file("a.raw", None), remote_file("b.raw", None)];
         let overall = OverallBar::new(&multi, "PXD000001", &files);
-        assert!(!overall.byte_driven);
-        assert_eq!(overall.bar.length(), Some(2));
-        overall.inc_bytes(999); // no-op in count mode
+        assert_eq!(overall.bar.length(), Some(0));
+        overall.note_file_size(7);
+        assert_eq!(overall.bar.length(), Some(7));
+        overall.inc_bytes(7);
         overall.inc_file();
-        assert_eq!(overall.bar.position(), 1);
+        assert_eq!(overall.bar.position(), 7);
     }
 
     /// Builds an InlineValidation whose checksum cell is pre-set, so no
