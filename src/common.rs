@@ -149,6 +149,13 @@ pub fn count_style() -> ProgressStyle {
         .progress_chars("=>-")
 }
 
+/// Ticking spinner for indeterminate waits: `⠋ Fetching file list for PXD...`
+pub fn spinner_style() -> ProgressStyle {
+    ProgressStyle::with_template("{spinner} {msg}")
+        .expect("hardcoded progress template is valid")
+        .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
+}
+
 /// A dynamically-resizable concurrency limiter. The `limit` field is adjusted
 /// at runtime by an AIMD controller based on measured throughput; `in_flight`
 /// tracks how many guards are currently held. Waiters sleep on `Notify`.

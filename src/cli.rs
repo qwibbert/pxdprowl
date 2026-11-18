@@ -162,7 +162,7 @@ pub async fn run(args: Args) -> Result<()> {
 
     match &args.command {
         // Listing is not a download; run it directly.
-        Some(Commands::Files { accession }) => cmd_files(&client, config, accession).await,
+        Some(Commands::Files { accession }) => cmd_files(&client, config, accession, &multi).await,
         Some(command) => {
             let action = match command {
                 Commands::Dataset { accession } => DownloadRequest::Dataset(accession.clone()),
@@ -334,7 +334,12 @@ async fn cmd_dataset(
     accession: &str,
     multi: &MultiProgress,
 ) -> Result<()> {
-    let (repo, repo_id) = resolve_repo(client, config, accession).await?;
+    let (repo, repo_id) = fetch_with_spinner(
+        multi,
+        &format!("Resolving {accession} via ProteomeXchange..."),
+        resolve_repo(client, config, accession),
+    )
+    .await?;
     let target = repository::DatasetTarget {
         repo_id: &repo_id,
         label: accession,
@@ -352,12 +357,25 @@ async fn cmd_dataset(
 }
 
 /// Prints the RAW file list for `accession`.
-async fn cmd_files(client: &reqwest::Client, config: &Config, accession: &str) -> Result<()> {
-    let (repo, repo_id) = resolve_repo(client, config, accession).await?;
-    let files = repo
-        .get_file_list(client, config, &repo_id)
-        .await
-        .with_context(|| format!("failed to fetch file list for {accession}"))?;
+async fn cmd_files(
+    client: &reqwest::Client,
+    config: &Config,
+    accession: &str,
+    multi: &MultiProgress,
+) -> Result<()> {
+    let (repo, repo_id) = fetch_with_spinner(
+        multi,
+        &format!("Resolving {accession} via ProteomeXchange..."),
+        resolve_repo(client, config, accession),
+    )
+    .await?;
+    let files = fetch_with_spinner(
+        multi,
+        &format!("Fetching file list for {accession}..."),
+        repo.get_file_list(client, config, &repo_id),
+    )
+    .await
+    .with_context(|| format!("failed to fetch file list for {accession}"))?;
 
     if files.is_empty() {
         println!("No RAW files found for {accession}.");
@@ -388,11 +406,19 @@ async fn cmd_file_by_name(
     file_name: &str,
     multi: &MultiProgress,
 ) -> Result<()> {
-    let (repo, repo_id) = resolve_repo(client, config, accession).await?;
-    let files = repo
-        .get_file_list(client, config, &repo_id)
-        .await
-        .with_context(|| format!("failed to fetch file list for {accession}"))?;
+    let (repo, repo_id) = fetch_with_spinner(
+        multi,
+        &format!("Resolving {accession} via ProteomeXchange..."),
+        resolve_repo(client, config, accession),
+    )
+    .await?;
+    let files = fetch_with_spinner(
+        multi,
+        &format!("Fetching file list for {accession}..."),
+        repo.get_file_list(client, config, &repo_id),
+    )
+    .await
+    .with_context(|| format!("failed to fetch file list for {accession}"))?;
 
     let file = files
         .iter()
@@ -459,6 +485,23 @@ async fn cmd_file_by_url(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Runs `fut` while showing a ticking spinner with `msg`, so a slow API call
+/// (the iProX PROXI endpoint can take over a minute per record) doesn't look
+/// like a hang. The spinner is cleared on success and on error alike.
+async fn fetch_with_spinner<T>(
+    multi: &MultiProgress,
+    msg: &str,
+    fut: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    let bar = multi.add(ProgressBar::new_spinner());
+    bar.set_style(common::spinner_style());
+    bar.set_message(msg.to_string());
+    bar.enable_steady_tick(std::time::Duration::from_millis(120));
+    let result = fut.await;
+    bar.finish_and_clear();
+    result
+}
 
 /// Resolves a PXD `accession` through ProteomeXchange to the repository
 /// hosting it, plus the repository-local id its API is keyed by (the `MSV...`
