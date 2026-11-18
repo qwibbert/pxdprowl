@@ -21,6 +21,12 @@ use super::repository::Repository;
 /// iProX PROXI API base, keyed by PXD accession.
 pub const IPROX_PROXI_BASE: &str = "https://www.iprox.cn/proxi/datasets";
 
+/// Total timeout for iProX PROXI calls. The endpoint is very slow — observed
+/// 47–93 s for a single dataset record — so the shared [`common::API_TIMEOUT`]
+/// (60 s) times out on roughly half of all requests. Use a larger budget for
+/// iProX only; the other repositories answer in well under a second.
+pub const IPROX_API_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// cvParam accession of "Associated raw file URI".
 const RAW_FILE_URI_ACCESSION: &str = "MS:1002846";
 
@@ -151,7 +157,7 @@ impl Iprox {
                 client
                     .get(&url)
                     .header("Accept", "application/json")
-                    .timeout(common::API_TIMEOUT)
+                    .timeout(IPROX_API_TIMEOUT)
                     .send()
                     .await
                     .with_context(|| format!("failed to fetch iProX record for {accession}"))?
@@ -187,6 +193,13 @@ mod tests {
             {"accession": "MS:1002846", "name": "Associated raw file URI", "value": "ftp://not-http/a.raw"}
         ]
     }"#;
+
+    #[test]
+    fn iprox_api_timeout_exceeds_shared_api_timeout() {
+        // The iProX PROXI endpoint routinely takes longer than 60 s to answer
+        // a single dataset record, so it needs its own, larger budget.
+        assert!(IPROX_API_TIMEOUT > common::API_TIMEOUT);
+    }
 
     #[test]
     fn split_url_drops_project_segment() {
