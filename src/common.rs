@@ -50,6 +50,7 @@ pub struct PrideFile {
     /// The possible download URLs for the file.
     pub locations: Vec<FileLocation>,
     /// The size of the file as reported by PRIDE.
+    #[serde(rename = "fileSizeBytes")]
     pub file_size: Option<u64>,
 }
 
@@ -391,7 +392,7 @@ mod tests {
             "fileName": "sample.raw",
             "fileCategory": {"value": "RAW"},
             "publicFileLocations": [{"name": "FTP Protocol", "value": "ftp://ftp.pride.ebi.ac.uk/x.raw"}],
-            "fileSize": 123
+            "fileSizeBytes": 123
         }"#;
         let file: PrideFile = serde_json::from_str(json).unwrap();
         assert_eq!(file.file_name, "sample.raw");
