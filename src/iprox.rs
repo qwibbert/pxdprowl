@@ -8,11 +8,19 @@
 //! certificate is only valid for `*.iprox.cn`). The server supports `Range`
 //! requests for resume. Only `Associated raw file URI` entries are listed as
 //! RAW files.
+//!
+//! PROXI reports no file sizes, so after listing, each file's size is
+//! discovered with a HEAD request (`Content-Length`) — exact, unlike the
+//! website's own file-size metadata, which is only approximate — and used
+//! for the `files` listing, the progress bars, and size validation.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use log::debug;
 use serde::Deserialize;
+use tokio::sync::Semaphore;
 
 use super::common::{self, RemoteFile};
 use super::config::Config;
@@ -29,6 +37,9 @@ pub const IPROX_API_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 
 /// cvParam accession of "Associated raw file URI".
 const RAW_FILE_URI_ACCESSION: &str = "MS:1002846";
+
+/// Maximum number of concurrent HEAD requests used to discover file sizes.
+const HEAD_CONCURRENCY: usize = 16;
 
 /// The [iProX](https://www.iprox.org) repository.
 #[derive(Debug, Clone, Copy)]
@@ -87,6 +98,61 @@ impl Iprox {
             }
         }
         url.to_string()
+    }
+
+    /// Fills in `size` of every listed file that has a URL but no known size,
+    /// via a HEAD request's `Content-Length`. PROXI reports no sizes, but the
+    /// download server does. Best effort: a failed HEAD leaves `size` as
+    /// `None`, and the download then discovers the size from the GET
+    /// response's `Content-Length` as before.
+    async fn fill_sizes_from_head(client: &reqwest::Client, files: &mut [RemoteFile]) {
+        let sem = Arc::new(Semaphore::new(HEAD_CONCURRENCY));
+        let mut set = tokio::task::JoinSet::new();
+        for (idx, file) in files.iter().enumerate() {
+            if file.size.is_some() || file.url.is_empty() {
+                continue;
+            }
+            let permit = match sem.clone().acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => continue, // semaphore closed; skip this file
+            };
+            let client = client.clone();
+            let url = file.url.clone();
+            set.spawn(async move {
+                let _permit = permit;
+                let result = async {
+                    let resp = client
+                        .head(&url)
+                        .timeout(common::API_TIMEOUT)
+                        .send()
+                        .await
+                        .with_context(|| format!("HEAD {url} failed"))?
+                        .error_for_status()
+                        .with_context(|| format!("server returned an error for HEAD {url}"))?;
+                    // Read the header directly: Response::content_length() is
+                    // 0 for HEAD responses because they carry no body.
+                    let size = resp
+                        .headers()
+                        .get(reqwest::header::CONTENT_LENGTH)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|s| s.parse::<u64>().ok());
+                    Ok::<_, anyhow::Error>(size)
+                };
+                (idx, result.await)
+            });
+        }
+        while let Some(task) = set.join_next().await {
+            match task {
+                Ok((idx, Ok(Some(size)))) => files[idx].size = Some(size),
+                Ok((idx, Ok(None))) => {
+                    debug!("HEAD {} returned no Content-Length", files[idx].url);
+                }
+                Ok((idx, Err(e))) => {
+                    debug!("HEAD size lookup failed for {}: {e:#}", files[idx].url);
+                }
+                Err(e) => debug!("HEAD size lookup task panicked: {e}"),
+            }
+        }
     }
 
     /// Splits a download URL into (relative_path, name), dropping everything
@@ -170,11 +236,15 @@ impl Iprox {
         })
         .await?;
 
-        Ok(record
+        let mut files: Vec<RemoteFile> = record
             .data_files
             .into_iter()
             .filter_map(IproxFile::to_remote_file)
-            .collect())
+            .collect();
+        // PROXI lists no sizes; ask each file's URL for its Content-Length so
+        // the listing, progress bars and size validation all have real sizes.
+        Self::fill_sizes_from_head(client, &mut files).await;
+        Ok(files)
     }
 }
 

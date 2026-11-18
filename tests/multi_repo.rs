@@ -47,6 +47,7 @@ fn spawn_mock() -> (u16, std::thread::JoinHandle<()>) {
                 let mut buf = [0u8; 8192];
                 let n = stream.read(&mut buf).unwrap();
                 let request = String::from_utf8_lossy(&buf[..n]);
+                let method = request.split_whitespace().next().unwrap_or("");
                 let target = request
                     .lines()
                     .next()
@@ -136,7 +137,10 @@ fn spawn_mock() -> (u16, std::thread::JoinHandle<()>) {
                     )
                 };
                 let _ = stream.write_all(head.as_bytes());
-                let _ = stream.write_all(&body);
+                // HEAD responses carry headers only, no body.
+                if method != "HEAD" {
+                    let _ = stream.write_all(&body);
+                }
                 let _ = stream.flush();
             });
         }
@@ -247,6 +251,8 @@ async fn iprox_listing_keeps_only_raw_http_files() {
         files[0].url,
         format!("{base}/iprox/IPX0019033000/IPX0019033001/a.raw")
     );
+    // PROXI reports no sizes; the listing discovers them via HEAD Content-Length.
+    assert_eq!(files[0].size, Some(5));
     drop(server);
 }
 
