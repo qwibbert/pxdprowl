@@ -366,7 +366,19 @@ pub async fn download_dataset<R: Repository>(
     let files = repo.get_file_list(client, config, repo_id).await?;
     info!("{label}: {} file(s) listed", files.len());
 
-    let output_dir = dest.join(label);
+    // The label and the listing's relative paths become filesystem paths, so
+    // refuse anything that could escape the output directory (`..`, absolute
+    // paths) before any directory is created.
+    let output_dir = common::checked_join(dest, label)
+        .with_context(|| format!("unsafe dataset directory name {label:?}"))?;
+    for file in &files {
+        common::checked_join(&output_dir, &file.relative_path).with_context(|| {
+            format!(
+                "unsafe file path {:?} in dataset {label}",
+                file.relative_path
+            )
+        })?;
+    }
     tokio::fs::create_dir_all(&output_dir).await?;
 
     // Overall dataset bar: byte-driven when the listing reports sizes (so the
@@ -536,9 +548,18 @@ impl<R: Repository> InlineValidation<'_, R> {
     async fn validate(&self, file: &common::RemoteFile) -> Result<()> {
         let cell = self
             .checksums
-            .get_or_init(|| self.repo.fetch_checksums(self.client, self.config, self.repo_id))
+            .get_or_init(|| {
+                self.repo
+                    .fetch_checksums(self.client, self.config, self.repo_id)
+            })
             .await;
-        let path = self.output_dir.join(&file.relative_path);
+        let path =
+            common::checked_join(self.output_dir, &file.relative_path).with_context(|| {
+                format!(
+                    "unsafe file path {:?} in dataset {}",
+                    file.relative_path, self.label
+                )
+            })?;
         match cell {
             Ok(Some(map)) => {
                 if map.is_empty() {
@@ -957,6 +978,72 @@ mod tests {
             .await
             .unwrap();
         assert!(dir.join("raw").join("a.raw").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn download_dataset_refuses_listing_path_that_escapes_output_dir() {
+        let files: &'static [common::RemoteFile] = Box::leak(
+            vec![common::RemoteFile {
+                name: "evil.raw".to_string(),
+                relative_path: "../evil.raw".to_string(),
+                url: "https://example.org/evil.raw".to_string(),
+                size: Some(5),
+                category: Some("RAW".to_string()),
+            }]
+            .into_boxed_slice(),
+        );
+        let repo = StubRepo {
+            files,
+            checksums: None,
+        };
+        let config = Config::default();
+        let client = reqwest::Client::new();
+        let limits = Arc::new(common::ConcurrencyLimits::new(&config));
+        let multi = MultiProgress::new();
+        let dir = temp_dir("escape");
+        let target = DatasetTarget {
+            repo_id: "PXD000001",
+            label: "PXD000001",
+            dest: &dir,
+            gate: None,
+        };
+        let err = download_dataset(repo, &client, &config, &limits, &target, &multi)
+            .await
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("unsafe file path"), "message was: {msg}");
+        // Nothing may have been created on disk.
+        assert!(!dir.join("PXD000001").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn download_dataset_refuses_label_that_escapes_output_dir() {
+        let repo = StubRepo {
+            files: &[],
+            checksums: None,
+        };
+        let config = Config::default();
+        let client = reqwest::Client::new();
+        let limits = Arc::new(common::ConcurrencyLimits::new(&config));
+        let multi = MultiProgress::new();
+        let dir = temp_dir("escape-label");
+        let target = DatasetTarget {
+            repo_id: "PXD000001",
+            label: "../evil",
+            dest: &dir,
+            gate: None,
+        };
+        let err = download_dataset(repo, &client, &config, &limits, &target, &multi)
+            .await
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("unsafe dataset directory"),
+            "message was: {msg}"
+        );
+        assert!(!dir.join("..").join("evil").exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

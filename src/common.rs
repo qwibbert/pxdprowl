@@ -1,11 +1,12 @@
 //! Shared types, constants, and helpers for repository download/validation.
 
+use std::path::{Component, Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use indicatif::ProgressStyle;
 use log::{info, warn};
 use serde::Deserialize;
@@ -37,6 +38,54 @@ pub const DOWNLOAD_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::f
 /// Per-chunk read timeout for downloads; a stall longer than this aborts the
 /// attempt so the retry loop can resume from the `.part` file.
 pub const DOWNLOAD_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Checks that `accession` is a well-formed ProteomeXchange accession: `PXD`
+/// followed by one or more digits, e.g. `PXD000001`.
+///
+/// The accession is interpolated into API URLs and used as the output
+/// directory name, so anything else (empty, `..`, `?`/`#`, spaces, ...) is
+/// rejected up front instead of producing confusing request or path errors
+/// downstream.
+///
+/// # Errors
+///
+/// Returns an error when `accession` does not match the `PXD<digits>` form.
+pub fn validate_accession(accession: &str) -> Result<()> {
+    let bytes = accession.as_bytes();
+    let valid =
+        bytes.len() > 3 && &bytes[..3] == b"PXD" && bytes[3..].iter().all(u8::is_ascii_digit);
+    if valid {
+        Ok(())
+    } else {
+        bail!(
+            "invalid accession {accession:?} (expected \"PXD\" followed by digits, e.g. PXD000001)"
+        )
+    }
+}
+
+/// Joins `rel` onto `base`, refusing any path that would escape `base`:
+/// empty paths, NUL bytes, absolute paths, `.`/`..` components, and Windows
+/// prefixes are all rejected.
+///
+/// Repository listings supply `rel` (file names / relative paths), so every
+/// destination path must go through this before being written to disk —
+/// `Path::join` alone happily joins `../x` or an absolute path onto `base`.
+///
+/// # Errors
+///
+/// Returns an error when `rel` is not a safe relative path.
+pub fn checked_join(base: &Path, rel: &str) -> Result<PathBuf> {
+    if rel.is_empty() || rel.contains('\0') {
+        bail!("unsafe file path {rel:?}: must be a non-empty relative path");
+    }
+    if !Path::new(rel)
+        .components()
+        .all(|c| matches!(c, Component::Normal(_)))
+    {
+        bail!("unsafe file path {rel:?}: must not contain `.`/`..` or be absolute");
+    }
+    Ok(base.join(rel))
+}
 
 /// A file record from `GET /projects/{accession}/files/all`.
 #[derive(Debug, Clone, Deserialize)]
@@ -360,6 +409,65 @@ impl Drop for ConcurrencyLimits {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_accession_accepts_pxd_ids() {
+        assert!(validate_accession("PXD000001").is_ok());
+        assert!(validate_accession("PXD1").is_ok());
+        assert!(validate_accession("PXD999999999999").is_ok());
+    }
+
+    #[test]
+    fn validate_accession_rejects_malformed_ids() {
+        for bad in [
+            "",
+            "PXD",
+            "pxd000001",
+            "PXDabc",
+            "MSV000079263",
+            "PXD000001?foo=bar",
+            "PXD000001#frag",
+            "PXD000001/../x",
+            "../tmp/x",
+            "not an accession",
+        ] {
+            let err = validate_accession(bad).unwrap_err();
+            assert!(
+                err.to_string().contains("invalid accession"),
+                "expected rejection of {bad:?}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn checked_join_accepts_plain_relative_paths() {
+        let base = Path::new("/out");
+        assert_eq!(
+            checked_join(base, "a.raw").unwrap(),
+            PathBuf::from("/out/a.raw")
+        );
+        assert_eq!(
+            checked_join(base, "raw/sub/a.raw").unwrap(),
+            PathBuf::from("/out/raw/sub/a.raw")
+        );
+    }
+
+    #[test]
+    fn checked_join_rejects_escaping_or_absolute_paths() {
+        let base = Path::new("/out");
+        for bad in [
+            "",
+            ".",
+            "..",
+            "../evil.raw",
+            "raw/../../evil.raw",
+            "/etc/passwd",
+            "./a.raw",
+            "a\0b",
+        ] {
+            assert!(checked_join(base, bad).is_err(), "should reject {bad:?}");
+        }
+    }
 
     fn file_with_locations(locations: Vec<FileLocation>) -> PrideFile {
         PrideFile {

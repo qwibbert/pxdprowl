@@ -70,6 +70,8 @@ $ pxdprowl file url https://.../sample.raw  # download one file by URL
 
 Downloaded files land in `datasets/{PXD}/...` (the default output directory can be configured, see [Configuration](#configuration)).
 
+Input is validated before anything is requested or written: accessions must be ProteomeXchange IDs (`PXD` followed by digits, e.g. `PXD000001`), `file url` accepts HTTPS URLs (plain HTTP only for loopback hosts), and file paths reported by a repository that would escape the output directory (`..`, absolute paths) are rejected.
+
 ### Batch downloads from a config file
 
 With no subcommand, `pxdprowl` will try to find a config file (`pxdprowl.toml`) in the current directory. The structure of this config file is described in the [Configuration](#configuration) section. If it doesn't find a config file, PXDProwl will show a help message with a hint.

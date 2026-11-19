@@ -85,7 +85,8 @@ pub async fn validate_file(
     file_size: u64,
     multi: &MultiProgress,
 ) -> Result<()> {
-    let path = output_dir.join(rel_path);
+    let path = common::checked_join(output_dir, rel_path)
+        .with_context(|| format!("unsafe relative path {rel_path:?}"))?;
 
     // Per-file byte bar for MD5 reading progress.
     let md5_pb = multi.add(ProgressBar::new(file_size));
@@ -196,7 +197,8 @@ pub async fn validate_checksums(
             val_bar.inc(1);
             continue;
         };
-        let path = output_dir.join(&rel_path);
+        let path = common::checked_join(output_dir, &rel_path)
+            .with_context(|| format!("unsafe relative path {rel_path:?}"))?;
         let file_size = file
             .size
             .unwrap_or_else(|| std::fs::metadata(&path).map_or(0, |m| m.len()));
@@ -403,10 +405,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn validate_file_rejects_relative_path_escaping_output_dir() {
+        let dir = temp_dir("escape");
+        let limits = Arc::new(common::ConcurrencyLimits::new(&Config::default()));
+        let multi = MultiProgress::new();
+        let err = validate_file(
+            &limits,
+            "PXD000001",
+            &dir,
+            "../evil.raw",
+            MD5_HELLO,
+            5,
+            &multi,
+        )
+        .await
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("unsafe relative path"), "message was: {msg}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn validate_size_accepts_matching_size() {
         let dir = temp_dir("size-ok");
         std::fs::write(dir.join("a.raw"), b"hello").unwrap();
-        validate_size("PXD000001", &dir.join("a.raw"), 5).await.unwrap();
+        validate_size("PXD000001", &dir.join("a.raw"), 5)
+            .await
+            .unwrap();
         assert!(dir.join("a.raw").exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
