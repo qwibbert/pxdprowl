@@ -62,6 +62,13 @@ pub struct Args {
     #[arg(long, global = true)]
     pub no_update_check: bool,
 
+    /// A dataset accession given without a subcommand, e.g. `pxdprowl
+    /// PXD000001`. Instead of failing with an "unrecognized subcommand"
+    /// error, pxdprowl prints a hint with the commands available for that
+    /// dataset.
+    #[arg(value_name = "DATASET")]
+    pub accession: Option<String>,
+
     /// The subcommand to execute.
     /// When not specified, check if a config file is present.
     #[command(subcommand)]
@@ -167,6 +174,13 @@ pub async fn run(args: Args) -> Result<()> {
         common::cpu_count()
     );
 
+    if args.command.is_some() && args.accession.is_some() {
+        bail!(
+            "unexpected argument {:?}: a dataset accession cannot be combined with a subcommand",
+            args.accession.as_deref().unwrap_or_default()
+        );
+    }
+
     if args.command.is_some() {
         hint_subcommand_overrides_config(&resolved);
     }
@@ -199,6 +213,11 @@ pub async fn run(args: Args) -> Result<()> {
             cmd_download(&client, config, &limits, &action, &multi).await
         }
         None => {
+            // A bare dataset accession (`pxdprowl PXD000001`): show the hint
+            // instead of the config-file behavior / "unrecognized subcommand".
+            if let Some(arg) = &args.accession {
+                return cmd_bare_accession(arg, &resolved);
+            }
             if resolved.downloads.is_empty() {
                 // Nothing to do: show the help plus a hint instead of erroring.
                 use std::io::Write as _;
@@ -304,6 +323,81 @@ fn help_with_hint(resolved: &ResolvedConfig) -> Result<String> {
         }
     }
     Ok(text)
+}
+
+/// Handles `pxdprowl PXD000001` — a bare dataset accession with no
+/// subcommand. A well-formed PXD accession gets a hint listing the commands
+/// that can be run on that dataset; anything else keeps the old clap-style
+/// "unrecognized subcommand" error.
+fn cmd_bare_accession(arg: &str, resolved: &ResolvedConfig) -> Result<()> {
+    if common::validate_accession(arg).is_err() {
+        let mut cmd = Args::command();
+        let err = cmd.error(
+            clap::error::ErrorKind::InvalidSubcommand,
+            format!("unrecognized subcommand {arg:?}"),
+        );
+        // Strip clap's own "error: " prefix; main() adds it back via anyhow.
+        let rendered = err.render().to_string();
+        let msg = rendered.trim_start_matches("error: ").trim_end();
+        bail!("{msg}");
+    }
+    use std::io::Write as _;
+    let mut stdout = std::io::stdout().lock();
+    stdout
+        .write_all(accession_hint(arg, resolved).as_bytes())
+        .context("failed to print hint")?;
+    Ok(())
+}
+
+/// Renders the hint shown for `pxdprowl PXD000001` (a bare dataset accession,
+/// no subcommand): the commands that can be run on that dataset, plus a
+/// pointer to the config-file batch mode.
+fn accession_hint(accession: &str, resolved: &ResolvedConfig) -> String {
+    use std::fmt::Write as _;
+    let mut text = String::new();
+    // write! into a String is infallible; the ignores keep clippy quiet.
+    let _ = writeln!(
+        text,
+        "`{accession}` is a dataset accession, but no subcommand was given. Try one of:"
+    );
+    let _ = writeln!(text);
+    let _ = writeln!(
+        text,
+        "  pxdprowl dataset {accession}          # download all RAW files of the dataset"
+    );
+    let _ = writeln!(
+        text,
+        "  pxdprowl files {accession}            # list the RAW files of the dataset"
+    );
+    let _ = writeln!(
+        text,
+        "  pxdprowl file name {accession} FILE   # download one file by name"
+    );
+    let _ = writeln!(
+        text,
+        "  pxdprowl file url URL                 # download a file directly from a URL"
+    );
+    let _ = writeln!(
+        text,
+        "  pxdprowl update                       # check for a newer pxdprowl release"
+    );
+    let _ = writeln!(text);
+    match &resolved.config_path {
+        Some(path) => {
+            let _ = writeln!(
+                text,
+                "Or edit {} to list downloads and run `pxdprowl` with no arguments.",
+                path.display()
+            );
+        }
+        None => {
+            let _ = writeln!(
+                text,
+                "Or create a {CONFIG_FILE_NAME} with `datasets`/`files`/`urls` and run `pxdprowl` with no arguments."
+            );
+        }
+    }
+    text
 }
 
 /// When a subcommand is given, the config file's download lists don't apply.
@@ -870,6 +964,63 @@ mod tests {
     fn args_parse_update_subcommand() {
         let args = Args::try_parse_from(["pxdprowl", "update"]).unwrap();
         assert!(matches!(args.command, Some(Commands::Update)));
+    }
+
+    #[test]
+    fn args_parse_bare_accession_as_positional() {
+        let args = Args::try_parse_from(["pxdprowl", "PXD000001"]).unwrap();
+        assert_eq!(args.accession.as_deref(), Some("PXD000001"));
+        assert!(args.command.is_none());
+        // Global flags still work in front of the positional.
+        let args = Args::try_parse_from(["pxdprowl", "--no-update-check", "PXD000001"]).unwrap();
+        assert_eq!(args.accession.as_deref(), Some("PXD000001"));
+        assert!(args.no_update_check);
+        assert!(args.command.is_none());
+    }
+
+    #[test]
+    fn args_parse_subcommand_does_not_fill_positional() {
+        let args = Args::try_parse_from(["pxdprowl", "files", "PXD000001"]).unwrap();
+        assert!(args.accession.is_none());
+        assert!(matches!(args.command, Some(Commands::Files { .. })));
+        let args = Args::try_parse_from(["pxdprowl", "dataset", "PXD000001"]).unwrap();
+        assert!(args.accession.is_none());
+        assert!(matches!(args.command, Some(Commands::Dataset { .. })));
+    }
+
+    #[test]
+    fn accession_hint_lists_the_dataset_commands() {
+        let hint = accession_hint("PXD000001", &resolved_without_config());
+        assert!(
+            hint.contains("`PXD000001` is a dataset accession"),
+            "hint was:\n{hint}"
+        );
+        assert!(
+            hint.contains("pxdprowl dataset PXD000001"),
+            "hint was:\n{hint}"
+        );
+        assert!(
+            hint.contains("pxdprowl files PXD000001"),
+            "hint was:\n{hint}"
+        );
+        assert!(
+            hint.contains("pxdprowl file name PXD000001 FILE"),
+            "hint was:\n{hint}"
+        );
+        assert!(hint.contains("pxdprowl file url URL"), "hint was:\n{hint}");
+        assert!(hint.contains("pxdprowl update"), "hint was:\n{hint}");
+        // Without a config file, the hint points at creating one.
+        assert!(hint.contains("create a pxdprowl.toml"), "hint was:\n{hint}");
+    }
+
+    #[test]
+    fn accession_hint_names_the_loaded_config_file() {
+        let resolved = ResolvedConfig {
+            config_path: Some(PathBuf::from("my/pxdprowl.toml")),
+            ..resolved_without_config()
+        };
+        let hint = accession_hint("PXD000001", &resolved);
+        assert!(hint.contains("my/pxdprowl.toml"), "hint was:\n{hint}");
     }
 
     fn resolved_without_config() -> ResolvedConfig {
