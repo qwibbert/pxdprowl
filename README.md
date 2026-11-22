@@ -37,6 +37,8 @@ integrity validation.
 - Built-in update check against crates.io: every command checks once a day in
   the background and prints a notice when a newer release is available (plus
   the explicit `pxdprowl update` subcommand); disable with `--no-update-check`
+- Cargo-style coloured hints and help on terminals (auto-disabled when piped or
+  when `NO_COLOR` is set)
 - Usable as a Rust library
 
 ## Installation

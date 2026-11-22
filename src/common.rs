@@ -406,6 +406,53 @@ impl Drop for ConcurrencyLimits {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Terminal colours
+// ---------------------------------------------------------------------------
+
+/// SGR sequence that resets all attributes.
+const SGR_RESET: &str = "\x1b[0m";
+/// SGR for hint labels: bold yellow, like cargo's `hint:`.
+const SGR_HINT: &str = "\x1b[1;33m";
+/// SGR for emphasized text (accessions, commands): bold.
+const SGR_BOLD: &str = "\x1b[1m";
+
+/// Whether ANSI colours may be emitted on a stream that `is_tty`. Follows the
+/// usual conventions (as cargo does): colours only on a terminal, disabled by
+/// a non-empty `NO_COLOR`, and disabled when `TERM=dumb`.
+pub fn colours_enabled(is_tty: bool) -> bool {
+    colours_allowed(
+        is_tty,
+        std::env::var_os("NO_COLOR").as_deref(),
+        std::env::var("TERM").ok().as_deref(),
+    )
+}
+
+/// Pure core of [`colours_enabled`], with the environment injected.
+fn colours_allowed(is_tty: bool, no_colour: Option<&std::ffi::OsStr>, term: Option<&str>) -> bool {
+    is_tty && no_colour.is_none_or(|v| v.is_empty()) && term != Some("dumb")
+}
+
+/// Wraps `text` in the SGR sequence `sgr` (plus a reset) when `colours` is
+/// true; returns `text` unchanged otherwise.
+fn paint(text: &str, sgr: &str, colours: bool) -> String {
+    if colours {
+        format!("{sgr}{text}{SGR_RESET}")
+    } else {
+        text.to_string()
+    }
+}
+
+/// Styles `text` as a hint label (bold yellow) when `colours` is true.
+pub fn hint_style(text: &str, colours: bool) -> String {
+    paint(text, SGR_HINT, colours)
+}
+
+/// Styles `text` as bold (for emphasized parts of a hint) when `colours` is true.
+pub fn bold_style(text: &str, colours: bool) -> String {
+    paint(text, SGR_BOLD, colours)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -415,6 +462,31 @@ mod tests {
         assert!(validate_accession("PXD000001").is_ok());
         assert!(validate_accession("PXD1").is_ok());
         assert!(validate_accession("PXD999999999999").is_ok());
+    }
+
+    #[test]
+    fn colours_allowed_only_on_tty_without_no_colour_or_dumb_term() {
+        use std::ffi::OsStr;
+        assert!(colours_allowed(true, None, Some("xterm-256color")));
+        assert!(!colours_allowed(false, None, Some("xterm"))); // not a terminal
+        assert!(!colours_allowed(true, Some(OsStr::new("1")), Some("xterm"))); // NO_COLOR set
+        assert!(!colours_allowed(true, Some(OsStr::new("")), Some("dumb"))); // TERM=dumb
+        // An empty NO_COLOR does not disable colours (per no-color.org).
+        assert!(colours_allowed(true, Some(OsStr::new("")), Some("xterm")));
+        // TERM unset entirely is fine (e.g. some CI environments).
+        assert!(colours_allowed(true, None, None));
+    }
+
+    #[test]
+    fn hint_style_wraps_in_bold_yellow_only_when_colours_on() {
+        assert_eq!(hint_style("Hint:", false), "Hint:");
+        assert_eq!(hint_style("Hint:", true), "\x1b[1;33mHint:\x1b[0m");
+    }
+
+    #[test]
+    fn bold_style_wraps_in_bold_only_when_colours_on() {
+        assert_eq!(bold_style("PXD000001", false), "PXD000001");
+        assert_eq!(bold_style("PXD000001", true), "\x1b[1mPXD000001\x1b[0m");
     }
 
     #[test]
