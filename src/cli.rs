@@ -399,6 +399,7 @@ async fn cmd_files(
         );
     }
     println!("\n{} RAW file(s) found for {accession}.", files.len());
+    println!("{}", format_total_size(&files));
     Ok(())
 }
 
@@ -643,6 +644,37 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
+/// Sums the known file sizes in `files`, returning the total in bytes plus
+/// the number of files whose size the repository did not report.
+fn total_size(files: &[common::RemoteFile]) -> (u64, usize) {
+    let mut total = 0u64;
+    let mut unknown = 0usize;
+    for file in files {
+        match file.size {
+            Some(size) => total = total.saturating_add(size),
+            None => unknown += 1,
+        }
+    }
+    (total, unknown)
+}
+
+/// Renders the total-size line of the `files` listing: the sum of the known
+/// sizes, noting how many files had no reported size (those are not included
+/// in the sum, or the total is unknown when none of them do).
+fn format_total_size(files: &[common::RemoteFile]) -> String {
+    let (total, unknown) = total_size(files);
+    if unknown == 0 {
+        format!("Total size: {}", format_size(total))
+    } else if unknown == files.len() {
+        format!("Total size: unknown ({unknown} file(s) without a reported size)")
+    } else {
+        format!(
+            "Total size: {} ({unknown} file(s) without a reported size not included)",
+            format_size(total)
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -661,6 +693,82 @@ mod tests {
     #[test]
     fn format_size_gib() {
         assert_eq!(format_size(3 * 1024 * 1024 * 1024), "3.0 GiB");
+    }
+
+    fn remote_file(name: &str, size: Option<u64>) -> common::RemoteFile {
+        common::RemoteFile {
+            name: name.to_string(),
+            relative_path: name.to_string(),
+            url: format!("https://example.org/{name}"),
+            size,
+            category: Some("RAW".to_string()),
+        }
+    }
+
+    #[test]
+    fn total_size_sums_all_known_sizes() {
+        let files = vec![
+            remote_file("a.raw", Some(100)),
+            remote_file("b.raw", Some(2048)),
+        ];
+        assert_eq!(total_size(&files), (2148, 0));
+    }
+
+    #[test]
+    fn total_size_counts_files_with_unknown_size() {
+        let files = vec![
+            remote_file("a.raw", Some(100)),
+            remote_file("b.raw", None),
+            remote_file("c.raw", None),
+        ];
+        assert_eq!(total_size(&files), (100, 2));
+    }
+
+    #[test]
+    fn total_size_all_unknown_counts_every_file() {
+        let files = vec![remote_file("a.raw", None), remote_file("b.raw", None)];
+        assert_eq!(total_size(&files), (0, 2));
+    }
+
+    #[test]
+    fn total_size_empty_list_is_zero() {
+        assert_eq!(total_size(&[]), (0, 0));
+    }
+
+    #[test]
+    fn total_size_saturates_instead_of_overflowing() {
+        let files = vec![
+            remote_file("a.raw", Some(u64::MAX)),
+            remote_file("b.raw", Some(1)),
+        ];
+        assert_eq!(total_size(&files), (u64::MAX, 0));
+    }
+
+    #[test]
+    fn format_total_size_all_sizes_known() {
+        let files = vec![
+            remote_file("a.raw", Some(100)),
+            remote_file("b.raw", Some(2048)),
+        ];
+        assert_eq!(format_total_size(&files), "Total size: 2.1 KiB");
+    }
+
+    #[test]
+    fn format_total_size_some_sizes_unknown_notes_the_omission() {
+        let files = vec![remote_file("a.raw", Some(100)), remote_file("b.raw", None)];
+        assert_eq!(
+            format_total_size(&files),
+            "Total size: 100 B (1 file(s) without a reported size not included)"
+        );
+    }
+
+    #[test]
+    fn format_total_size_all_sizes_unknown_is_unknown() {
+        let files = vec![remote_file("a.raw", None), remote_file("b.raw", None)];
+        assert_eq!(
+            format_total_size(&files),
+            "Total size: unknown (2 file(s) without a reported size)"
+        );
     }
 
     #[test]
