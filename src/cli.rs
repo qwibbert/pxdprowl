@@ -220,10 +220,11 @@ pub async fn run(args: Args) -> Result<()> {
             }
             if resolved.downloads.is_empty() {
                 // Nothing to do: show the help plus a hint instead of erroring.
-                use std::io::Write as _;
+                use std::io::{IsTerminal as _, Write as _};
+                let colours = common::colours_enabled(std::io::stdout().is_terminal());
                 let mut stdout = std::io::stdout().lock();
                 stdout
-                    .write_all(help_with_hint(&resolved)?.as_bytes())
+                    .write_all(help_with_hint(&resolved, colours)?.as_bytes())
                     .context("failed to print help")?;
                 return Ok(());
             }
@@ -295,9 +296,12 @@ pub async fn run(args: Args) -> Result<()> {
 }
 
 /// Renders the long help plus a hint about subcommands / the config file,
-/// shown when `pxdprowl` runs without a subcommand and with nothing to download.
-fn help_with_hint(resolved: &ResolvedConfig) -> Result<String> {
+/// shown when `pxdprowl` runs without a subcommand and with nothing to
+/// download. The `Hint:` label is coloured (cargo-style bold yellow) when
+/// `colours` is true.
+fn help_with_hint(resolved: &ResolvedConfig, colours: bool) -> Result<String> {
     use std::fmt::Write as _;
+    let hint_label = common::hint_style("Hint:", colours);
     let mut cmd = Args::command();
     let mut buf = Vec::new();
     cmd.write_long_help(&mut buf)
@@ -307,7 +311,7 @@ fn help_with_hint(resolved: &ResolvedConfig) -> Result<String> {
         Some(path) => {
             write!(
                 text,
-                "\nHint: {} was loaded but lists no downloads. Add `datasets`, `files` or \
+                "\n{hint_label} {} was loaded but lists no downloads. Add `datasets`, `files` or \
                  `urls` to it, or pass a subcommand.\n",
                 path.display()
             )
@@ -316,7 +320,7 @@ fn help_with_hint(resolved: &ResolvedConfig) -> Result<String> {
         None => {
             write!(
                 text,
-                "\nHint: pass a subcommand, or create a {CONFIG_FILE_NAME} with \
+                "\n{hint_label} pass a subcommand, or create a {CONFIG_FILE_NAME} with \
                  `datasets`/`files`/`urls` and run `pxdprowl` without arguments.\n"
             )
             .context("failed to render hint")?;
@@ -330,35 +334,46 @@ fn help_with_hint(resolved: &ResolvedConfig) -> Result<String> {
 /// that can be run on that dataset; anything else keeps the old clap-style
 /// "unrecognized subcommand" error.
 fn cmd_bare_accession(arg: &str, resolved: &ResolvedConfig) -> Result<()> {
+    use std::io::IsTerminal as _;
     if common::validate_accession(arg).is_err() {
+        let colours = common::colours_enabled(std::io::stderr().is_terminal());
         let mut cmd = Args::command();
         let err = cmd.error(
             clap::error::ErrorKind::InvalidSubcommand,
             format!("unrecognized subcommand {arg:?}"),
         );
         // Strip clap's own "error: " prefix; main() adds it back via anyhow.
-        let rendered = err.render().to_string();
+        // Keep the ANSI styling when the error will land on a coloured terminal.
+        let rendered = if colours {
+            err.render().ansi().to_string()
+        } else {
+            err.render().to_string()
+        };
         let msg = rendered.trim_start_matches("error: ").trim_end();
         bail!("{msg}");
     }
     use std::io::Write as _;
+    let colours = common::colours_enabled(std::io::stdout().is_terminal());
     let mut stdout = std::io::stdout().lock();
     stdout
-        .write_all(accession_hint(arg, resolved).as_bytes())
+        .write_all(accession_hint(arg, resolved, colours).as_bytes())
         .context("failed to print hint")?;
     Ok(())
 }
 
 /// Renders the hint shown for `pxdprowl PXD000001` (a bare dataset accession,
 /// no subcommand): the commands that can be run on that dataset, plus a
-/// pointer to the config-file batch mode.
-fn accession_hint(accession: &str, resolved: &ResolvedConfig) -> String {
+/// pointer to the config-file batch mode. The `Hint:` label is coloured
+/// (cargo-style bold yellow) and the accession is bold when `colours` is true.
+fn accession_hint(accession: &str, resolved: &ResolvedConfig, colours: bool) -> String {
     use std::fmt::Write as _;
+    let hint_label = common::hint_style("Hint:", colours);
+    let accession_bold = common::bold_style(&format!("`{accession}`"), colours);
     let mut text = String::new();
     // write! into a String is infallible; the ignores keep clippy quiet.
     let _ = writeln!(
         text,
-        "`{accession}` is a dataset accession, but no subcommand was given. Try one of:"
+        "{hint_label} {accession_bold} is a dataset accession, but no subcommand was given. Try one of:"
     );
     let _ = writeln!(text);
     let _ = writeln!(
@@ -525,9 +540,11 @@ async fn cmd_files(
 /// Unlike the automatic check, a failed check is an error here: the user
 /// asked for it.
 async fn cmd_update(client: &reqwest::Client) -> Result<()> {
+    use std::io::IsTerminal as _;
+    let colours = common::colours_enabled(std::io::stdout().is_terminal());
     match update::check(client, true).await {
         Ok(update::UpdateStatus::Available(latest)) => {
-            println!("{}", update::update_notice(&latest));
+            println!("{}", update::update_notice(&latest, colours));
         }
         Ok(update::UpdateStatus::UpToDate) => {
             println!("pxdprowl {} is up to date.", update::current_version());
@@ -541,9 +558,11 @@ async fn cmd_update(client: &reqwest::Client) -> Result<()> {
 /// stderr when a newer release is available. Never fails: check errors are
 /// logged at debug level only.
 async fn notify_if_update_available(client: &reqwest::Client) {
+    use std::io::IsTerminal as _;
+    let colours = common::colours_enabled(std::io::stderr().is_terminal());
     match update::check(client, false).await {
         Ok(update::UpdateStatus::Available(latest)) => {
-            eprintln!("{}", update::update_notice(&latest));
+            eprintln!("{}", update::update_notice(&latest, colours));
         }
         Ok(update::UpdateStatus::UpToDate) => {}
         Err(e) => debug!("update check failed: {e:#}"),
@@ -990,9 +1009,9 @@ mod tests {
 
     #[test]
     fn accession_hint_lists_the_dataset_commands() {
-        let hint = accession_hint("PXD000001", &resolved_without_config());
+        let hint = accession_hint("PXD000001", &resolved_without_config(), false);
         assert!(
-            hint.contains("`PXD000001` is a dataset accession"),
+            hint.contains("Hint: `PXD000001` is a dataset accession"),
             "hint was:\n{hint}"
         );
         assert!(
@@ -1011,6 +1030,24 @@ mod tests {
         assert!(hint.contains("pxdprowl update"), "hint was:\n{hint}");
         // Without a config file, the hint points at creating one.
         assert!(hint.contains("create a pxdprowl.toml"), "hint was:\n{hint}");
+        // Plain when colours are off.
+        assert!(!hint.contains('\x1b'), "hint was:\n{hint}");
+    }
+
+    #[test]
+    fn accession_hint_is_coloured_when_colours_on() {
+        let hint = accession_hint("PXD000001", &resolved_without_config(), true);
+        assert!(
+            hint.contains(
+                "\x1b[1;33mHint:\x1b[0m \x1b[1m`PXD000001`\x1b[0m is a dataset accession"
+            ),
+            "hint was:\n{hint}"
+        );
+        // The command lines keep the plain accession so the columns stay aligned.
+        assert!(
+            hint.contains("  pxdprowl dataset PXD000001          #"),
+            "hint was:\n{hint}"
+        );
     }
 
     #[test]
@@ -1019,7 +1056,7 @@ mod tests {
             config_path: Some(PathBuf::from("my/pxdprowl.toml")),
             ..resolved_without_config()
         };
-        let hint = accession_hint("PXD000001", &resolved);
+        let hint = accession_hint("PXD000001", &resolved, false);
         assert!(hint.contains("my/pxdprowl.toml"), "hint was:\n{hint}");
     }
 
@@ -1033,9 +1070,10 @@ mod tests {
 
     #[test]
     fn help_hint_without_config_suggests_creating_one() {
-        let text = help_with_hint(&resolved_without_config()).unwrap();
+        let text = help_with_hint(&resolved_without_config(), false).unwrap();
         assert!(text.contains("Usage:"));
         assert!(text.contains("Hint: pass a subcommand, or create a pxdprowl.toml"));
+        assert!(!text.contains('\x1b'), "text was:\n{text}");
     }
 
     #[test]
@@ -1044,8 +1082,17 @@ mod tests {
             config_path: Some(PathBuf::from("my/pxdprowl.toml")),
             ..resolved_without_config()
         };
-        let text = help_with_hint(&resolved).unwrap();
+        let text = help_with_hint(&resolved, false).unwrap();
         assert!(text.contains("my/pxdprowl.toml was loaded but lists no downloads"));
+    }
+
+    #[test]
+    fn help_hint_colours_the_hint_label_when_colours_on() {
+        let text = help_with_hint(&resolved_without_config(), true).unwrap();
+        assert!(
+            text.contains("\x1b[1;33mHint:\x1b[0m pass a subcommand"),
+            "text was:\n{text}"
+        );
     }
 
     #[test]

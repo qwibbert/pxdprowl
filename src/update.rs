@@ -313,10 +313,12 @@ fn write_last_check(path: &Path, now: SystemTime) {
     }
 }
 
-/// The notice printed when a newer release is available.
-pub fn update_notice(latest: &Version) -> String {
+/// The notice printed when a newer release is available. The `Hint:` label is
+/// coloured (cargo-style bold yellow) when `colours` is true.
+pub fn update_notice(latest: &Version, colours: bool) -> String {
+    let hint_label = crate::common::hint_style("Hint:", colours);
     format!(
-        "A new version of pxdprowl is available: {latest} (you have {current}). Update with `cargo install pxdprowl`.",
+        "{hint_label} A new version of pxdprowl is available: {latest} (you have {current}). Update with `cargo install pxdprowl`.",
         current = current_version()
     )
 }
@@ -430,11 +432,25 @@ mod tests {
 
     #[test]
     fn update_notice_names_both_versions_and_the_install_command() {
-        let notice = update_notice(&Version::parse("9.9.9").unwrap());
+        let notice = update_notice(&Version::parse("9.9.9").unwrap(), false);
+        assert!(
+            notice.contains("Hint: A new version"),
+            "notice was: {notice}"
+        );
         assert!(notice.contains("9.9.9"), "notice was: {notice}");
         assert!(notice.contains(current_version()), "notice was: {notice}");
         assert!(
             notice.contains("cargo install pxdprowl"),
+            "notice was: {notice}"
+        );
+        assert!(!notice.contains('\x1b'), "notice was: {notice}");
+    }
+
+    #[test]
+    fn update_notice_colours_the_hint_label_when_enabled() {
+        let notice = update_notice(&Version::parse("9.9.9").unwrap(), true);
+        assert!(
+            notice.contains("\x1b[1;33mHint:\x1b[0m A new version"),
             "notice was: {notice}"
         );
     }
