@@ -33,6 +33,8 @@ pub const ENV_DOWNLOAD_CONCURRENCY: &str = "PXDPROWL_DOWNLOAD_CONCURRENCY";
 pub const ENV_VALIDATE_CONCURRENCY: &str = "PXDPROWL_VALIDATE_CONCURRENCY";
 /// Env var overriding [`Config::max_retries`].
 pub const ENV_MAX_RETRIES: &str = "PXDPROWL_MAX_RETRIES";
+/// Env var overriding [`Config::update_check`].
+pub const ENV_UPDATE_CHECK: &str = "PXDPROWL_UPDATE_CHECK";
 
 /// Resolved runtime settings, passed explicitly through the library.
 ///
@@ -49,6 +51,10 @@ pub struct Config {
     pub validate_concurrency: Option<usize>,
     /// Maximum number of attempts for retryable operations.
     pub max_retries: usize,
+    /// Whether to check crates.io for a newer release at the end of a run
+    /// (rate-limited to once a day). The explicit `pxdprowl update`
+    /// subcommand checks regardless of this setting.
+    pub update_check: bool,
 }
 
 /// The result of [`Config::resolve`]: the settings plus the download plan
@@ -109,6 +115,8 @@ pub struct CliOverrides {
     pub validate_concurrency: Option<usize>,
     /// `--max-retries N`
     pub max_retries: Option<usize>,
+    /// `--no-update-check`
+    pub no_update_check: bool,
 }
 
 /// Raw settings as read from env vars (unvalidated).
@@ -118,6 +126,7 @@ struct EnvOverrides {
     download_concurrency: Option<usize>,
     validate_concurrency: Option<usize>,
     max_retries: Option<usize>,
+    update_check: Option<bool>,
 }
 
 /// Raw contents of the config file (unvalidated).
@@ -127,6 +136,7 @@ struct FileOverrides {
     download_concurrency: Option<usize>,
     validate_concurrency: Option<usize>,
     max_retries: Option<usize>,
+    update_check: Option<bool>,
     datasets: Vec<String>,
     files: Vec<FileEntry>,
     urls: Vec<String>,
@@ -140,6 +150,7 @@ struct ConfigFile {
     download_concurrency: Option<usize>,
     validate_concurrency: Option<usize>,
     max_retries: Option<usize>,
+    update_check: Option<bool>,
     #[serde(default)]
     datasets: Vec<String>,
     #[serde(default)]
@@ -163,6 +174,7 @@ impl From<ConfigFile> for FileOverrides {
             download_concurrency: file.download_concurrency,
             validate_concurrency: file.validate_concurrency,
             max_retries: file.max_retries,
+            update_check: file.update_check,
             datasets: file.datasets,
             files: file.files,
             urls: file.urls,
@@ -196,6 +208,7 @@ impl EnvOverrides {
             download_concurrency: env_usize(ENV_DOWNLOAD_CONCURRENCY)?,
             validate_concurrency: env_usize(ENV_VALIDATE_CONCURRENCY)?,
             max_retries: env_usize(ENV_MAX_RETRIES)?,
+            update_check: env_bool(ENV_UPDATE_CHECK)?,
         })
     }
 }
@@ -208,6 +221,7 @@ impl Default for Config {
             download_concurrency: (cpu_count() * 2).min(8),
             validate_concurrency: None,
             max_retries: 5,
+            update_check: true,
         }
     }
 }
@@ -288,6 +302,15 @@ impl Config {
                     .or(file.max_retries)
                     .unwrap_or(defaults.max_retries),
             )?,
+            // `--no-update-check` is a CLI-only switch: when given it wins
+            // over env and file; otherwise env wins over file over default.
+            update_check: if cli.no_update_check {
+                false
+            } else {
+                env.update_check
+                    .or(file.update_check)
+                    .unwrap_or(defaults.update_check)
+            },
         })
     }
 }
@@ -346,6 +369,31 @@ fn env_path(key: &str) -> Result<Option<PathBuf>> {
     }
 }
 
+/// Reads a boolean from an env var. Returns `Ok(None)` if unset; a set but
+/// unrecognized value is an error so typos don't silently fall back.
+fn env_bool(key: &str) -> Result<Option<bool>> {
+    match std::env::var(key) {
+        Ok(value) => parse_env_bool(key, &value).map(Some),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            bail!("{key} is not valid Unicode")
+        }
+    }
+}
+
+/// Parses an env var value as a boolean: `1`/`true`/`yes`/`on` → true,
+/// `0`/`false`/`no`/`off` → false (case-insensitive, surrounding whitespace
+/// ignored).
+fn parse_env_bool(key: &str, value: &str) -> Result<bool> {
+    match value.trim().to_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        other => bail!(
+            "invalid value for {key}: {other:?} (expected a boolean like `true`/`false` or `1`/`0`)"
+        ),
+    }
+}
+
 /// Validates that an explicitly configured concurrency/retry value is positive.
 fn positive(source: &str, n: usize) -> Result<usize> {
     if n == 0 {
@@ -372,6 +420,7 @@ mod tests {
         assert!(c.download_concurrency > 0);
         assert_eq!(c.validate_concurrency, None);
         assert!(c.max_retries > 0);
+        assert!(c.update_check);
     }
 
     #[test]
@@ -381,6 +430,7 @@ mod tests {
             download_concurrency: Some(2),
             validate_concurrency: None,
             max_retries: Some(3),
+            update_check: Some(true),
             ..Default::default()
         };
         let env = EnvOverrides {
@@ -388,6 +438,7 @@ mod tests {
             download_concurrency: Some(6),
             validate_concurrency: Some(7),
             max_retries: None,
+            update_check: Some(false),
         };
         let cli = CliOverrides {
             output: Some(PathBuf::from("cli-data")),
@@ -399,6 +450,75 @@ mod tests {
         assert_eq!(c.download_concurrency, 9); // cli
         assert_eq!(c.validate_concurrency, Some(7)); // env
         assert_eq!(c.max_retries, 3); // file
+        assert!(!c.update_check); // env
+    }
+
+    #[test]
+    fn merge_no_update_check_flag_wins_over_env_and_file() {
+        let file = FileOverrides {
+            update_check: Some(true),
+            ..Default::default()
+        };
+        let env = EnvOverrides {
+            update_check: Some(true),
+            ..Default::default()
+        };
+        let cli = CliOverrides {
+            no_update_check: true,
+            ..Default::default()
+        };
+        let c = Config::merge(&cli, &file, &env, None).unwrap();
+        assert!(!c.update_check);
+    }
+
+    #[test]
+    fn merge_update_check_falls_back_to_file_then_default() {
+        let file = FileOverrides {
+            update_check: Some(false),
+            ..Default::default()
+        };
+        let c = Config::merge(
+            &CliOverrides::default(),
+            &file,
+            &EnvOverrides::default(),
+            None,
+        )
+        .unwrap();
+        assert!(!c.update_check); // file
+        let c = Config::merge(
+            &CliOverrides::default(),
+            &FileOverrides::default(),
+            &EnvOverrides::default(),
+            None,
+        )
+        .unwrap();
+        assert!(c.update_check); // default
+    }
+
+    #[test]
+    fn parse_env_bool_accepts_common_spellings() {
+        for (value, expected) in [
+            ("1", true),
+            ("true", true),
+            ("TRUE", true),
+            (" Yes ", true),
+            ("on", true),
+            ("0", false),
+            ("false", false),
+            ("NO", false),
+            ("off", false),
+        ] {
+            assert_eq!(
+                parse_env_bool("PXDPROWL_X", value).unwrap(),
+                expected,
+                "value: {value:?}"
+            );
+        }
+        let err = parse_env_bool("PXDPROWL_X", "maybe").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("PXDPROWL_X"),
+            "error was: {err:#}"
+        );
     }
 
     #[test]
@@ -453,6 +573,7 @@ mod tests {
             download-concurrency = 3
             validate-concurrency = 2
             max-retries = 10
+            update-check = false
             datasets = ["PXD000001", "PXD000002"]
             urls = ["https://example.org/x.raw"]
 
@@ -467,6 +588,7 @@ mod tests {
         assert_eq!(raw.download_concurrency, Some(3));
         assert_eq!(raw.validate_concurrency, Some(2));
         assert_eq!(raw.max_retries, Some(10));
+        assert_eq!(raw.update_check, Some(false));
         // Fixed order: datasets, then files, then urls.
         assert_eq!(
             raw.downloads(),

@@ -20,6 +20,7 @@ pub mod massive;
 pub mod pride;
 pub mod proteomexchange;
 pub mod repository;
+pub mod update;
 pub mod validate;
 
 pub use common::{ConcurrencyLimits, RemoteFile};
@@ -29,4 +30,5 @@ pub use massive::Massive;
 pub use pride::Pride;
 pub use proteomexchange::{HostingRepository, PxDatasetInfo};
 pub use repository::{Repo, Repository};
+pub use update::{UpdateStatus, Version, check, current_version, latest_version, update_notice};
 pub use validate::{fetch_checksums, validate_checksums, validate_file, validate_size};

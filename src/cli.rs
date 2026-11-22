@@ -10,12 +10,13 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser, Subcommand};
 use indicatif::{MultiProgress, ProgressBar};
-use log::{info, warn};
+use log::{debug, info, warn};
 
 use crate::common;
 use crate::config::{CONFIG_FILE_NAME, CliOverrides, Config, DownloadRequest, ResolvedConfig};
 use crate::proteomexchange::{self, HostingRepository};
 use crate::repository::{self, Repo, Repository};
+use crate::update;
 
 // ---------------------------------------------------------------------------
 // Argument types
@@ -55,6 +56,12 @@ pub struct Args {
     #[arg(long, global = true, value_name = "N")]
     pub max_retries: Option<usize>,
 
+    /// Disable the automatic update check against crates.io.
+    /// Overrides PXDPROWL_UPDATE_CHECK and the `update-check` key in
+    /// pxdprowl.toml. The `update` subcommand checks regardless of this flag.
+    #[arg(long, global = true)]
+    pub no_update_check: bool,
+
     /// The subcommand to execute.
     /// When not specified, check if a config file is present.
     #[command(subcommand)]
@@ -83,6 +90,9 @@ pub enum Commands {
         /// or file URL
         source: FileSource,
     },
+
+    /// Check crates.io for a newer pxdprowl release.
+    Update,
 }
 
 /// Where to fetch a single file from.
@@ -131,6 +141,7 @@ pub async fn run(args: Args) -> Result<()> {
         download_concurrency: args.download_concurrency,
         validate_concurrency: args.validate_concurrency,
         max_retries: args.max_retries,
+        no_update_check: args.no_update_check,
     })
     .context("invalid configuration")?;
     let config = &resolved.config;
@@ -160,9 +171,12 @@ pub async fn run(args: Args) -> Result<()> {
         hint_subcommand_overrides_config(&resolved);
     }
 
-    match &args.command {
+    let result = match &args.command {
         // Listing is not a download; run it directly.
         Some(Commands::Files { accession }) => cmd_files(&client, config, accession, &multi).await,
+        // An explicit update check runs directly too (and is not followed by
+        // the automatic one below).
+        Some(Commands::Update) => cmd_update(&client).await,
         Some(command) => {
             let action = match command {
                 Commands::Dataset { accession } => DownloadRequest::Dataset(accession.clone()),
@@ -180,6 +194,7 @@ pub async fn run(args: Args) -> Result<()> {
                     source: FileSource::Url { url },
                 } => DownloadRequest::Url(url.clone()),
                 Commands::Files { .. } => unreachable!("Files is dispatched above"),
+                Commands::Update => unreachable!("Update is dispatched above"),
             };
             cmd_download(&client, config, &limits, &action, &multi).await
         }
@@ -248,7 +263,16 @@ pub async fn run(args: Args) -> Result<()> {
                 bail!("{} download(s) failed: {}", failed.len(), failed.join(", "))
             }
         }
+    };
+
+    // Automatic update check, rate-limited to once per
+    // update::UPDATE_CHECK_INTERVAL and skipped for `pxdprowl update` (which
+    // checks explicitly). It runs after the command's own output and is
+    // best-effort: it never fails the command.
+    if config.update_check && !matches!(args.command, Some(Commands::Update)) {
+        notify_if_update_available(&client).await;
     }
+    result
 }
 
 /// Renders the long help plus a hint about subcommands / the config file,
@@ -401,6 +425,35 @@ async fn cmd_files(
     println!("\n{} RAW file(s) found for {accession}.", files.len());
     println!("{}", format_total_size(&files));
     Ok(())
+}
+
+/// Runs an explicit update check (`pxdprowl update`) and prints the result.
+/// Unlike the automatic check, a failed check is an error here: the user
+/// asked for it.
+async fn cmd_update(client: &reqwest::Client) -> Result<()> {
+    match update::check(client, true).await {
+        Ok(update::UpdateStatus::Available(latest)) => {
+            println!("{}", update::update_notice(&latest));
+        }
+        Ok(update::UpdateStatus::UpToDate) => {
+            println!("pxdprowl {} is up to date.", update::current_version());
+        }
+        Err(e) => bail!("update check failed: {e:#}"),
+    }
+    Ok(())
+}
+
+/// Runs the rate-limited automatic update check and prints a notice to
+/// stderr when a newer release is available. Never fails: check errors are
+/// logged at debug level only.
+async fn notify_if_update_available(client: &reqwest::Client) {
+    match update::check(client, false).await {
+        Ok(update::UpdateStatus::Available(latest)) => {
+            eprintln!("{}", update::update_notice(&latest));
+        }
+        Ok(update::UpdateStatus::UpToDate) => {}
+        Err(e) => debug!("update check failed: {e:#}"),
+    }
 }
 
 /// Downloads a single file identified by `accession` + `file_name` (matched
@@ -800,6 +853,23 @@ mod tests {
         assert_eq!(args.config, Some(PathBuf::from("my.toml")));
         assert_eq!(args.output, Some(PathBuf::from("out")));
         assert!(matches!(args.command, Some(Commands::Dataset { .. })));
+    }
+
+    #[test]
+    fn args_parse_no_update_check_flag() {
+        let args =
+            Args::try_parse_from(["pxdprowl", "--no-update-check", "files", "PXD000001"]).unwrap();
+        assert!(args.no_update_check);
+        assert!(matches!(args.command, Some(Commands::Files { .. })));
+        // Off by default.
+        let args = Args::try_parse_from(["pxdprowl", "files", "PXD000001"]).unwrap();
+        assert!(!args.no_update_check);
+    }
+
+    #[test]
+    fn args_parse_update_subcommand() {
+        let args = Args::try_parse_from(["pxdprowl", "update"]).unwrap();
+        assert!(matches!(args.command, Some(Commands::Update)));
     }
 
     fn resolved_without_config() -> ResolvedConfig {
