@@ -34,6 +34,9 @@ integrity validation.
   HTTP 429
 - Settings via CLI flags, environment variables, or an optional TOML config
   file; config-file batches run concurrently and summarize failures at the end
+- Built-in update check against crates.io: every command checks once a day in
+  the background and prints a notice when a newer release is available (plus
+  the explicit `pxdprowl update` subcommand); disable with `--no-update-check`
 - Usable as a Rust library
 
 ## Installation
@@ -48,6 +51,10 @@ $ cargo install pxdprowl
 ```
 
 Re-running `cargo install pxdprowl` upgrades to the latest released version.
+PXDProwl also checks crates.io for newer releases on its own — once a day
+after any command, and any time via `pxdprowl update` — and prints a notice
+when an update is available (disable with `--no-update-check`, see
+[Configuration](#configuration)).
 
 ### Build from source
 
@@ -66,6 +73,7 @@ $ pxdprowl dataset PXD000001                # download all RAW files of a datase
 $ pxdprowl files PXD000001                  # list the RAW files of a dataset
 $ pxdprowl file name PXD000001 sample.raw   # download one file by name
 $ pxdprowl file url https://.../sample.raw  # download one file by URL
+$ pxdprowl update                           # check crates.io for a newer release
 ```
 
 Downloaded files land in `datasets/{PXD}/...` (the default output directory can be configured, see [Configuration](#configuration)).
@@ -90,6 +98,7 @@ PXDProwl has 3 ways of adjusting its settings (in order of importance): CLI flag
 | Download concurrency | `--download-concurrency N` | `PXDPROWL_DOWNLOAD_CONCURRENCY` | `download-concurrency` | `min(2 * CPUs, 8)` |
 | Validation concurrency (fixed; disables the adaptive limiter) | `--validate-concurrency N` | `PXDPROWL_VALIDATE_CONCURRENCY` | `validate-concurrency` | adaptive |
 | Max retries per operation | `--max-retries N` | `PXDPROWL_MAX_RETRIES` | `max-retries` | `5` |
+| Update check against crates.io | `--no-update-check` | `PXDPROWL_UPDATE_CHECK` | `update-check` | enabled |
 | Config file path | `-c, --config PATH` | — | — | `./pxdprowl.toml` |
 | Verbosity | `-v` / `-vv` / `-vvv` | `RUST_LOG` | — | warnings only |
 
@@ -104,6 +113,7 @@ output = "datasets" # default: datasets
 download-concurrency = 4 # default: inferred from CPU count, max 8
 validate-concurrency = 8 # default: adaptive (auto-tuned)
 max-retries = 3 # default: 5
+update-check = true # default: true; check crates.io for newer releases once a day
 
 # What to download when running `pxdprowl` with no subcommand.
 # List any combination of the three options below.
@@ -172,13 +182,15 @@ config.output = "data".into();
 config.download_concurrency = 4;
 config.validate_concurrency = Some(8);
 config.max_retries = 3;
+config.update_check = false;
 ```
 
 The crate is organized into modules: `cli` (argument parsing and dispatch),
 `config` (settings resolution), `proteomexchange` (PXD → repository
 resolution), `repository` (the `Repository` trait, the `Repo` dispatcher and
 the shared download engine), the per-repository implementations `pride`,
-`massive` and `iprox`, and `validate` (checksum/size validation).
+`massive` and `iprox`, `update` (crates.io update checks), and `validate`
+(checksum/size validation).
 
 ## License
 
