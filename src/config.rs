@@ -12,6 +12,7 @@
 //!
 //! Library users skip file/env loading and construct a [`Config`] directly.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -99,6 +100,25 @@ impl DownloadRequest {
             Self::Url(url) => format!("url {url}"),
         }
     }
+}
+
+/// Deduplicates a batch's download `requests`, keeping the first occurrence
+/// of each. With concurrent execution, two tasks fetching the same file would
+/// race on the same `.part` file, so duplicates must not run twice.
+pub fn dedupe_requests(requests: &[DownloadRequest]) -> Vec<DownloadRequest> {
+    let mut seen = HashSet::new();
+    requests
+        .iter()
+        .filter(|request| {
+            if seen.insert((*request).clone()) {
+                true
+            } else {
+                log::warn!("duplicate download request skipped: {}", request.label());
+                false
+            }
+        })
+        .cloned()
+        .collect()
 }
 
 /// Per-setting overrides coming from the command line (`None` = not given).
@@ -689,6 +709,30 @@ mod tests {
         .unwrap_err();
         std::fs::remove_dir_all(&dir).unwrap();
         assert!(format!("{err:#}").contains(CONFIG_FILE_NAME));
+    }
+
+    #[test]
+    fn dedupe_requests_keeps_first_occurrence_of_each() {
+        let requests = vec![
+            DownloadRequest::Dataset("PXD000001".to_string()),
+            DownloadRequest::Url("https://x/y".to_string()),
+            DownloadRequest::Dataset("PXD000001".to_string()),
+            DownloadRequest::File {
+                accession: "PXD000001".to_string(),
+                file_name: "a.raw".to_string(),
+            },
+            DownloadRequest::Url("https://x/y".to_string()),
+        ];
+        let deduped = dedupe_requests(&requests);
+        assert_eq!(deduped.len(), 3);
+        assert_eq!(deduped[0].label(), "dataset PXD000001");
+        assert_eq!(deduped[1].label(), "url https://x/y");
+        assert_eq!(deduped[2].label(), "file PXD000001/a.raw");
+    }
+
+    #[test]
+    fn dedupe_requests_empty_batch_stays_empty() {
+        assert!(dedupe_requests(&[]).is_empty());
     }
 
     #[test]

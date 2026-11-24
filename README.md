@@ -175,25 +175,55 @@ Tip: run with `-vv` to see resume/skip decisions in the logs.
 
 ## Library use
 
-`pxdprowl` can be used as a library. Library users skip the config file and
-env vars entirely by starting from `pxdprowl::Config::default()` and adjusting
-fields:
+Add `pxdprowl` to your `Cargo.toml` and use [`pxdprowl::Client`](https://docs.rs/pxdprowl/latest/pxdprowl/struct.Client.html) to perform your required tasks. See the examples below for an overview of the possibilities.
 
-```rust,ignore
+```rust,no_run
+# async fn example() -> anyhow::Result<()> {
+// Settings start from the defaults; adjust the fields you care about.
 let mut config = pxdprowl::Config::default();
-config.output = "data".into();
+config.output = "datasets".into();
 config.download_concurrency = 4;
-config.validate_concurrency = Some(8);
-config.max_retries = 3;
 config.update_check = false;
+
+let client = pxdprowl::Client::new(config)?;
+
+// Download every RAW file of a dataset into `datasets/PXD000001/`;
+// returns the number of files.
+let count = client.download_dataset("PXD000001").await?;
+
+// Or just list the RAW files without downloading them.
+let files = client.list_files("PXD000001").await?;
+
+// Single files: by name within a dataset, or directly by URL.
+let path = client.download_file("PXD000001", "sample.raw").await?;
+let path = client.download_url("https://ftp.pride.ebi.ac.uk/pride/data/archive/2024/01/PXD000003/extra.raw").await?;
+
+// Batch: any mix of datasets, files and URLs, run concurrently.
+client
+    .download(&[
+        pxdprowl::DownloadRequest::Dataset("PXD000002".into()),
+        pxdprowl::DownloadRequest::Url("https://example.org/extra.raw".into()),
+    ])
+    .await?;
+# Ok(())
+# }
 ```
 
-The crate is organized into modules: `cli` (argument parsing and dispatch),
-`config` (settings resolution), `proteomexchange` (PXD → repository
-resolution), `repository` (the `Repository` trait, the `Repo` dispatcher and
-the shared download engine), the per-repository implementations `pride`,
-`massive` and `iprox`, `update` (crates.io update checks), and `validate`
-(checksum/size validation).
+`Client::new` draws no progress bars; build the client with
+`Client::with_progress(config, multi)` and your own `indicatif::MultiProgress`
+to display them. To inspect what a PXD accession resolves to before
+downloading, use `client.resolve("PXD000001")` (a
+[`ResolvedDataset`](https://docs.rs/pxdprowl/latest/pxdprowl/struct.ResolvedDataset.html)
+with the hosting [`Repo`](https://docs.rs/pxdprowl/latest/pxdprowl/enum.Repo.html),
+the repository-local id, and the full ProteomeXchange record).
+
+For finer control, the lower-level building blocks can be found in
+submodules: `config` (settings and [`DownloadRequest`](https://docs.rs/pxdprowl/latest/pxdprowl/enum.DownloadRequest.html)),
+`proteomexchange` (PXD → repository resolution), `repository` (the
+`Repository` trait, the `Repo` dispatcher and the shared download engine), the
+per-repository implementations `pride`, `massive` and `iprox`, `validate`
+(checksum/size validation), and `update` (crates.io update checks). The `cli`
+module is the binary's argument parsing and dispatch.
 
 ## License
 

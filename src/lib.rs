@@ -5,7 +5,8 @@
 //!
 //! The crate is split into a library (this module tree) and a thin binary
 //! entry point (`src/main.rs`). All logic lives here so it is testable and
-//! reusable.
+//! reusable. Library users should start from [`Client`]; the lower-level
+//! modules stay public for finer control.
 
 // Native `async fn` in traits is the recommended style (stable since 1.75);
 // the `Send`-bound caveat does not affect this crate because every spawned
@@ -13,6 +14,7 @@
 #![allow(async_fn_in_trait)]
 
 pub mod cli;
+pub mod client;
 pub mod common;
 pub mod config;
 pub mod iprox;
@@ -23,6 +25,7 @@ pub mod repository;
 pub mod update;
 pub mod validate;
 
+pub use client::{Client, ResolvedDataset};
 pub use common::{ConcurrencyLimits, RemoteFile};
 pub use config::{CliOverrides, Config, DownloadRequest, ResolvedConfig};
 pub use iprox::Iprox;
