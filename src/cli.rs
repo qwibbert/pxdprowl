@@ -79,10 +79,13 @@ pub struct Args {
 /// The available subcommands.
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// Download all RAW files of a ProteomeXchange dataset.
+    /// Download all RAW files of one or more ProteomeXchange datasets.
     Dataset {
-        /// ProteomeXchange accession, e.g. `PXD000001`.
-        accession: String,
+        /// ProteomeXchange accessions, e.g. `PXD000001`. Multiple accessions
+        /// may be given (`pxdprowl dataset PXD002901 PXD002902`) and are
+        /// downloaded concurrently, like the config file's `datasets` list.
+        #[arg(required = true, value_name = "ACCESSION")]
+        accessions: Vec<String>,
     },
 
     /// List the RAW files available for a ProteomeXchange dataset.
@@ -192,9 +195,18 @@ pub async fn run(args: Args) -> Result<()> {
         // An explicit update check runs directly too (and is not followed by
         // the automatic one below).
         Some(Commands::Update) => cmd_update(&client).await,
+        // One or more accessions run as a batch, exactly like the config
+        // file's `datasets` list.
+        Some(Commands::Dataset { accessions }) => {
+            let requests: Vec<DownloadRequest> = accessions
+                .iter()
+                .cloned()
+                .map(DownloadRequest::Dataset)
+                .collect();
+            run_batch(&client, config, &limits, &requests, &multi).await
+        }
         Some(command) => {
             let action = match command {
-                Commands::Dataset { accession } => DownloadRequest::Dataset(accession.clone()),
                 Commands::File {
                     source:
                         FileSource::Name {
@@ -208,6 +220,7 @@ pub async fn run(args: Args) -> Result<()> {
                 Commands::File {
                     source: FileSource::Url { url },
                 } => DownloadRequest::Url(url.clone()),
+                Commands::Dataset { .. } => unreachable!("Dataset is dispatched above"),
                 Commands::Files { .. } => unreachable!("Files is dispatched above"),
                 Commands::Update => unreachable!("Update is dispatched above"),
             };
@@ -379,7 +392,7 @@ fn accession_hint(accession: &str, resolved: &ResolvedConfig, colours: bool) -> 
     let _ = writeln!(text);
     let _ = writeln!(
         text,
-        "  pxdprowl dataset {accession}          # download all RAW files of the dataset"
+        "  pxdprowl dataset {accession} ...      # download all RAW files of one or more datasets"
     );
     let _ = writeln!(
         text,
@@ -455,6 +468,76 @@ async fn cmd_download(
             file_name,
         } => cmd_file_by_name(client, config, limits, accession, file_name, multi).await,
         DownloadRequest::Url(url) => cmd_file_by_url(client, config, limits, url, multi).await,
+    }
+}
+
+/// Runs a batch of download requests (from the config file or from
+/// `pxdprowl dataset ACCESSION...`): every request runs concurrently so a
+/// small dataset doesn't delay the others, all sharing the global concurrency
+/// limits, duplicates are skipped, and failures are collected and summarized
+/// at the end instead of stopping at the first one. With multiple requests,
+/// an overall count bar is shown on top of the per-request bars.
+///
+/// # Errors
+///
+/// Returns an error if any request in the batch failed.
+async fn run_batch(
+    client: &reqwest::Client,
+    config: &Config,
+    limits: &Arc<common::ConcurrencyLimits>,
+    requests: &[DownloadRequest],
+    multi: &MultiProgress,
+) -> Result<()> {
+    let downloads = dedupe_requests(requests);
+    // With multiple requests, show an overall count bar on top of the
+    // per-request bars.
+    let overall = (downloads.len() > 1).then(|| {
+        let bar = multi.add(ProgressBar::new(downloads.len() as u64));
+        bar.set_style(common::count_style());
+        bar.set_prefix("Downloads");
+        bar
+    });
+    let mut set = tokio::task::JoinSet::new();
+    for request in &downloads {
+        let client = client.clone();
+        let config = config.clone();
+        let limits = limits.clone();
+        let multi = multi.clone();
+        let overall = overall.clone();
+        let request = (*request).clone();
+        let label = request.label();
+        set.spawn(async move {
+            info!("starting {label}");
+            let result = cmd_download(&client, &config, &limits, &request, &multi).await;
+            if let Some(bar) = &overall {
+                bar.inc(1);
+            }
+            (label, result)
+        });
+    }
+    // Collect results as tasks complete (completion order, not spawn
+    // order) and summarize failures at the end.
+    let mut failed = Vec::new();
+    while let Some(task_result) = set.join_next().await {
+        match task_result {
+            Ok((_label, Ok(()))) => {}
+            Ok((label, Err(e))) => {
+                warn!("{label} failed: {e:#}");
+                failed.push(label);
+            }
+            Err(e) => {
+                warn!("download task panicked: {e}");
+                failed.push("unknown".to_string());
+            }
+        }
+    }
+    if let Some(bar) = &overall {
+        bar.finish_and_clear();
+    }
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        bail!("{} download(s) failed: {}", failed.len(), failed.join(", "))
     }
 }
 
@@ -932,6 +1015,46 @@ mod tests {
     }
 
     #[test]
+    fn args_parse_dataset_single_accession() {
+        let args = Args::try_parse_from(["pxdprowl", "dataset", "PXD000001"]).unwrap();
+        let Some(Commands::Dataset { accessions }) = args.command else {
+            panic!("expected the dataset subcommand");
+        };
+        assert_eq!(accessions, ["PXD000001"]);
+    }
+
+    #[test]
+    fn args_parse_dataset_multiple_accessions() {
+        let args =
+            Args::try_parse_from(["pxdprowl", "dataset", "PXD002901", "PXD002902", "PXD002903"])
+                .unwrap();
+        let Some(Commands::Dataset { accessions }) = args.command else {
+            panic!("expected the dataset subcommand");
+        };
+        assert_eq!(accessions, ["PXD002901", "PXD002902", "PXD002903"]);
+        // Global flags still work around the subcommand and its accessions.
+        let args = Args::try_parse_from([
+            "pxdprowl",
+            "--no-update-check",
+            "dataset",
+            "PXD002901",
+            "PXD002902",
+        ])
+        .unwrap();
+        assert!(args.no_update_check);
+        let Some(Commands::Dataset { accessions }) = args.command else {
+            panic!("expected the dataset subcommand");
+        };
+        assert_eq!(accessions, ["PXD002901", "PXD002902"]);
+    }
+
+    #[test]
+    fn args_dataset_requires_at_least_one_accession() {
+        let err = Args::try_parse_from(["pxdprowl", "dataset"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
     fn accession_hint_lists_the_dataset_commands() {
         let hint = accession_hint("PXD000001", &resolved_without_config(), false);
         assert!(
@@ -969,7 +1092,7 @@ mod tests {
         );
         // The command lines keep the plain accession so the columns stay aligned.
         assert!(
-            hint.contains("  pxdprowl dataset PXD000001          #"),
+            hint.contains("  pxdprowl dataset PXD000001 ...      #"),
             "hint was:\n{hint}"
         );
     }
