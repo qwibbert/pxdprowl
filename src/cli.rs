@@ -3,7 +3,6 @@
 //! Defines the clap argument structure and the [`run`] dispatcher that
 //! executes each subcommand against the PRIDE archive.
 
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -12,9 +11,11 @@ use clap::{CommandFactory, Parser, Subcommand};
 use indicatif::{MultiProgress, ProgressBar};
 use log::{debug, info, warn};
 
+use crate::client::ResolvedDataset;
 use crate::common;
-use crate::config::{CONFIG_FILE_NAME, CliOverrides, Config, DownloadRequest, ResolvedConfig};
-use crate::proteomexchange::{self, HostingRepository};
+use crate::config::{
+    CONFIG_FILE_NAME, CliOverrides, Config, DownloadRequest, ResolvedConfig, dedupe_requests,
+};
 use crate::repository::{self, Repo, Repository};
 use crate::update;
 
@@ -247,7 +248,7 @@ pub async fn run(args: Args) -> Result<()> {
                 let limits = limits.clone();
                 let multi = multi.clone();
                 let overall = overall.clone();
-                let request = (*request).clone();
+                let request = request.clone();
                 let label = request.label();
                 set.spawn(async move {
                     info!("starting {label}");
@@ -634,7 +635,7 @@ async fn cmd_file_by_url(
     url: &str,
     multi: &MultiProgress,
 ) -> Result<()> {
-    let file_name = download_url_file_name(url)?;
+    let file_name = common::download_url_file_name(url)?;
 
     tokio::fs::create_dir_all(&config.output)
         .await
@@ -658,55 +659,6 @@ async fn cmd_file_by_url(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Validates a user-supplied download `url` and returns the local file name
-/// derived from its last path segment (`download` when the URL ends in `/`).
-///
-/// Only HTTP(S) URLs are accepted, and plain HTTP only for loopback hosts
-/// (`localhost`, `127.0.0.0/8`, `::1`) — e.g. a local test server. The
-/// scheme is checked before any request is made, so `file:`, `ftp:` etc.
-/// fail fast with a clear error instead of a reqwest "scheme is not
-/// allowed" error after several retries. The URL parser normalizes `.`/`..`
-/// segments (even percent-encoded ones), so the derived name can never
-/// traverse out of the output directory.
-///
-/// # Errors
-///
-/// Returns an error if `url` is not an HTTP(S) URL (HTTPS unless loopback).
-fn download_url_file_name(url: &str) -> Result<String> {
-    let parsed = reqwest::Url::parse(url).with_context(|| format!("invalid URL: {url}"))?;
-    match parsed.scheme() {
-        "https" => {}
-        "http" if is_loopback_host(parsed.host_str()) => {}
-        scheme => bail!(
-            "unsupported URL scheme {scheme:?} in {url}: use https (http is allowed for loopback hosts only)"
-        ),
-    }
-    let file_name = parsed
-        .path_segments()
-        .and_then(|mut segs| segs.next_back())
-        .filter(|s| !s.is_empty())
-        .unwrap_or("download");
-    Ok(file_name.to_string())
-}
-
-/// Whether `host` is a loopback host name or address (`localhost`,
-/// `127.0.0.0/8`, `::1`), optionally with a trailing dot. `host` is a
-/// `Url::host_str()`, so IPv6 literals keep their brackets (`[::1]`).
-fn is_loopback_host(host: Option<&str>) -> bool {
-    let Some(host) = host else {
-        return false;
-    };
-    let host = host
-        .strip_prefix('[')
-        .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(host);
-    let host = host.strip_suffix('.').unwrap_or(host);
-    host == "localhost"
-        || host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback())
-}
-
 /// Runs `fut` while showing a ticking spinner with `msg`, so a slow API call
 /// (the iProX PROXI endpoint can take over a minute per record) doesn't look
 /// like a hang. The spinner is cleared on success and on error alike.
@@ -728,49 +680,21 @@ async fn fetch_with_spinner<T>(
 /// hosting it, plus the repository-local id its API is keyed by (the `MSV...`
 /// id for MassIVE; the PXD id itself for PRIDE and iProX).
 ///
+/// Thin wrapper over [`ResolvedDataset::resolve`], which holds the actual
+/// mapping logic and is shared with library users.
+///
 /// # Errors
 ///
 /// Returns an error if the ProteomeXchange lookup fails, if the dataset is
 /// hosted on a repository pxdprowl does not support, or if a MassIVE-hosted
 /// record carries no `MSV...` id.
-async fn resolve_repo(client: &reqwest::Client, config: &Config, accession: &str) -> Result<(Repo, String)> {
-    let info = proteomexchange::resolve(client, config, accession).await?;
-    let host = info.hosting_repository();
-    let repo = match host {
-        HostingRepository::Pride => Repo::Pride,
-        HostingRepository::Massive => Repo::Massive,
-        HostingRepository::Iprox => Repo::Iprox,
-        other => bail!(
-            "dataset {accession} is hosted on {} via ProteomeXchange; pxdprowl currently supports PRIDE, MassIVE and iProX",
-            other.name()
-        ),
-    };
-    let repo_id = match repo {
-        Repo::Massive => info
-            .repository_id()
-            .map(str::to_string)
-            .with_context(|| format!("ProteomeXchange record for {accession} has no MassIVE id"))?,
-        _ => accession.to_string(),
-    };
-    Ok((repo, repo_id))
-}
-
-/// Deduplicates the batch's download requests, keeping the first occurrence
-/// of each. With concurrent execution, two tasks fetching the same file would
-/// race on the same `.part` file, so duplicates must not run twice.
-fn dedupe_requests(requests: &[DownloadRequest]) -> Vec<&DownloadRequest> {
-    let mut seen = HashSet::new();
-    requests
-        .iter()
-        .filter(|request| {
-            if seen.insert((*request).clone()) {
-                true
-            } else {
-                warn!("duplicate download request skipped: {}", request.label());
-                false
-            }
-        })
-        .collect()
+async fn resolve_repo(
+    client: &reqwest::Client,
+    config: &Config,
+    accession: &str,
+) -> Result<(Repo, String)> {
+    let resolved = ResolvedDataset::resolve(client, config, accession).await?;
+    Ok((resolved.repo, resolved.repo_id))
 }
 
 /// Installs `env_logger` bridged through `indicatif-log-bridge` so log lines
@@ -1093,86 +1017,6 @@ mod tests {
             text.contains("\x1b[1;33mHint:\x1b[0m pass a subcommand"),
             "text was:\n{text}"
         );
-    }
-
-    #[test]
-    fn dedupe_requests_keeps_first_occurrence_of_each() {
-        let requests = vec![
-            DownloadRequest::Dataset("PXD000001".to_string()),
-            DownloadRequest::Url("https://x/y".to_string()),
-            DownloadRequest::Dataset("PXD000001".to_string()),
-            DownloadRequest::File {
-                accession: "PXD000001".to_string(),
-                file_name: "a.raw".to_string(),
-            },
-            DownloadRequest::Url("https://x/y".to_string()),
-        ];
-        let deduped = dedupe_requests(&requests);
-        assert_eq!(deduped.len(), 3);
-        assert_eq!(deduped[0].label(), "dataset PXD000001");
-        assert_eq!(deduped[1].label(), "url https://x/y");
-        assert_eq!(deduped[2].label(), "file PXD000001/a.raw");
-    }
-
-    #[test]
-    fn dedupe_requests_empty_batch_stays_empty() {
-        assert!(dedupe_requests(&[]).is_empty());
-    }
-
-    #[test]
-    fn download_url_file_name_derives_name_from_last_path_segment() {
-        assert_eq!(
-            download_url_file_name("https://example.org/a/b/sample.raw").unwrap(),
-            "sample.raw"
-        );
-        // The URL parser normalizes dot segments, so these are safe too.
-        assert_eq!(
-            download_url_file_name("https://example.org/a/../sample.raw").unwrap(),
-            "sample.raw"
-        );
-        assert_eq!(
-            download_url_file_name("https://example.org/%2e%2e").unwrap(),
-            "download"
-        );
-        // A URL ending in `/` has no usable last segment.
-        assert_eq!(
-            download_url_file_name("https://example.org/").unwrap(),
-            "download"
-        );
-    }
-
-    #[test]
-    fn download_url_file_name_allows_http_only_for_loopback() {
-        assert!(download_url_file_name("http://127.0.0.1:8123/a.raw").is_ok());
-        assert!(download_url_file_name("http://localhost/a.raw").is_ok());
-        assert!(download_url_file_name("http://[::1]/a.raw").is_ok());
-        // Remote hosts must use HTTPS.
-        let err = download_url_file_name("http://example.org/x.raw").unwrap_err();
-        assert!(err.to_string().contains("use https"), "message was: {err}");
-        assert!(download_url_file_name("http://192.168.1.10/x.raw").is_err());
-    }
-
-    #[test]
-    fn download_url_file_name_rejects_non_http_schemes_and_garbage() {
-        for bad in ["ftp://example.org/x.raw", "file:///etc/passwd", "not a url"] {
-            assert!(
-                download_url_file_name(bad).is_err(),
-                "should reject {bad:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn is_loopback_host_recognizes_loopback_only() {
-        assert!(is_loopback_host(Some("localhost")));
-        assert!(is_loopback_host(Some("localhost.")));
-        assert!(is_loopback_host(Some("127.0.0.1")));
-        assert!(is_loopback_host(Some("127.1.2.3")));
-        assert!(is_loopback_host(Some("::1")));
-        assert!(!is_loopback_host(Some("example.org")));
-        assert!(!is_loopback_host(Some("192.168.1.10")));
-        assert!(!is_loopback_host(Some("10.0.0.1")));
-        assert!(!is_loopback_host(None));
     }
 
     #[tokio::test]
