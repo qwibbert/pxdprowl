@@ -72,6 +72,7 @@ $ cargo build --release    # binary at target/release/pxdprowl
 
 ```console
 $ pxdprowl dataset PXD000001                # download all RAW files of a dataset
+$ pxdprowl dataset PXD002901 PXD002902      # ...or of several datasets at once
 $ pxdprowl files PXD000001                  # list the RAW files of a dataset
 $ pxdprowl file name PXD000001 sample.raw   # download one file by name
 $ pxdprowl file url https://.../sample.raw  # download one file by URL
